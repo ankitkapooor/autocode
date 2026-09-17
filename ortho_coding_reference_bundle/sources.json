@@ -1,0 +1,53 @@
+[
+  {
+    "dataset": "CMS PFS RVU26C",
+    "page": "https://www.cms.gov/medicare/payment/fee-schedules/physician/pfs-relative-value-files/rvu26c",
+    "match": "RVU26C",
+    "folder": "cpt",
+    "effective": "2026-07-01",
+    "mode": "single_anchor"
+  },
+  {
+    "dataset": "HCPCS July 2026 Alpha-Numeric",
+    "page": "https://www.cms.gov/medicare/coding-billing/healthcare-common-procedure-system/quarterly-update",
+    "match": "July 2026 Alpha-Numeric HCPCS File",
+    "folder": "hcpcs",
+    "effective": "2026-07-01",
+    "mode": "single_anchor"
+  },
+  {
+    "dataset": "ICD-10-CM April 2026 Code Descriptions",
+    "direct": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Publications/ICD10CM/2026-update/icd10cm-Code%20Descriptions-April-1-2026.zip",
+    "folder": "icd10cm",
+    "effective": "2026-04-01",
+    "mode": "direct"
+  },
+  {
+    "dataset": "ICD-10-CM April 2026 XML",
+    "direct": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Publications/ICD10CM/2026-update/icd10cm-April-1-2026-XML.zip",
+    "folder": "icd10cm",
+    "effective": "2026-04-01",
+    "mode": "direct"
+  },
+  {
+    "dataset": "ICD-10-CM April 2026 Tables and Index",
+    "direct": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Publications/ICD10CM/2026-update/icd10cm-table-and-index-April-1-2026.zip",
+    "folder": "icd10cm",
+    "effective": "2026-04-01",
+    "mode": "direct"
+  },
+  {
+    "dataset": "ICD-10-CM April 2026 Addenda",
+    "direct": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Publications/ICD10CM/2026-update/icd10cm-addenda-April-1-2026.zip",
+    "folder": "icd10cm",
+    "effective": "2026-04-01",
+    "mode": "direct"
+  },
+  {
+    "dataset": "ICD-10-CM April 2026 Guidelines",
+    "direct": "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/Publications/ICD10CM/2026-update/ICD-10-CM%20April%201%202026%20Guidelines%20Final.pdf",
+    "folder": "icd10cm",
+    "effective": "2026-04-01",
+    "mode": "direct"
+  }
+]

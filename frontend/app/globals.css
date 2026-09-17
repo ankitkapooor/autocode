@@ -1,0 +1,72 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+html { background: #f4f6f9; }
+body { margin: 0; min-width: 320px; font-family: Inter, "Avenir Next", "Segoe UI", ui-sans-serif, system-ui, sans-serif; background: #f4f6f9; }
+button, input, select, textarea { font: inherit; }
+button:focus-visible { outline: 2px solid #1e6f9f; outline-offset: 2px; }
+input:not([type="checkbox"]):not([type="file"]), select, textarea, .control { width: 100%; border: 1px solid #d9dfe8; border-radius: 0.45rem; background: #fff; padding: 0.65rem 0.75rem; color: #13213b; font-size: 0.875rem; outline: none; }
+input:focus, select:focus, textarea:focus, .control:focus { border-color: #1e6f9f; box-shadow: 0 0 0 3px rgba(30, 111, 159, 0.1); }
+textarea { resize: vertical; }
+
+@layer components {
+  .panel { @apply rounded-xl border border-line bg-panel shadow-panel; }
+  .panel-heading { @apply flex min-h-[72px] items-center justify-between gap-4 border-b border-line px-5 py-4; }
+  .panel-heading h2 { @apply text-[15px] font-semibold tracking-[-0.01em]; }
+  .panel-heading p { @apply mt-1 text-xs text-slate; }
+  .icon-button { @apply inline-flex h-9 w-9 items-center justify-center rounded-md border border-line bg-white text-slate transition hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40; }
+  .button-primary { @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-md bg-navy px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#173d65] disabled:cursor-not-allowed disabled:opacity-40; }
+  .button-secondary { @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-md border border-line bg-white px-4 py-2 text-sm font-semibold text-ink shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40; }
+  .gate-card { @apply flex flex-col justify-between gap-5 rounded-xl border bg-white p-5 shadow-panel md:flex-row md:items-center md:p-6; }
+  .gate-blocked { @apply border-l-[5px] border-l-amber; }
+  .gate-ready { @apply border-l-[5px] border-l-teal; }
+  .gate-icon { @apply grid h-11 w-11 shrink-0 place-items-center rounded-lg; }
+  .metric-icon { @apply grid h-10 w-10 shrink-0 place-items-center rounded-lg; }
+  .source-status { @apply grid h-8 w-8 shrink-0 place-items-center rounded-full; }
+  .source-good { @apply bg-emerald-50 text-teal; }
+  .source-warning { @apply bg-amber-50 text-amber; }
+  .status-pill { @apply inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.08em]; }
+  .status-good { @apply border-emerald-200 bg-emerald-50 text-emerald-800; }
+  .status-bad { @apply border-red-200 bg-red-50 text-red-800; }
+  .status-neutral { @apply border-slate-200 bg-slate-50 text-slate; }
+  .confidence-pill { @apply inline-flex items-center rounded-full px-2.5 py-1 text-[10px] font-bold tracking-[0.06em]; }
+  .confidence-green { @apply bg-emerald-100 text-emerald-800; }
+  .confidence-yellow { @apply bg-amber-100 text-amber-800; }
+  .confidence-red { @apply bg-red-100 text-red-800; }
+  .confidence-green:not(.confidence-pill) { @apply bg-emerald-500; }
+  .confidence-yellow:not(.confidence-pill) { @apply bg-amber-500; }
+  .confidence-red:not(.confidence-pill) { @apply bg-red-500; }
+  .search-box { @apply flex min-w-[240px] items-center gap-2 rounded-md border border-line bg-white px-3 text-slate; }
+  .search-box input { @apply border-0 p-0 shadow-none outline-none; }
+  .upload-zone { @apply flex min-h-[230px] cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-line bg-slate-50 p-8 text-center transition hover:border-blue hover:bg-sky-50; }
+  .upload-zone-active { @apply border-teal bg-emerald-50; }
+  .pipeline-row { @apply relative flex items-center gap-4 rounded-lg px-3 py-3 text-slate; }
+  .pipeline-active { @apply bg-sky-50 text-ink; }
+  .pipeline-dot { @apply grid h-7 w-7 shrink-0 place-items-center rounded-full border border-line bg-white font-mono text-[10px] font-semibold; }
+  .pipeline-done { @apply border-emerald-200 bg-emerald-50 text-teal; }
+  .pipeline-running { @apply border-sky-200 bg-sky-100 text-blue; }
+  .evidence-block { @apply block w-full rounded-md border border-transparent px-3 py-2 text-left text-sm leading-6 text-slate transition hover:border-sky-200 hover:bg-sky-50; }
+  .evidence-active { @apply border-sky-300 bg-sky-50 text-ink; }
+  .evidence-link { @apply inline-flex items-center gap-1.5 rounded-full border border-sky-200 bg-sky-50 px-2 py-1 text-[10px] font-semibold text-blue; }
+  .rule-row { @apply flex items-start gap-2 rounded-md px-2.5 py-2 text-xs leading-4; }
+  .rule-pass { @apply bg-emerald-50 text-emerald-800; }
+  .rule-warning { @apply bg-amber-50 text-amber-900; }
+  .rule-fail { @apply bg-red-50 text-red-800; }
+}
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { padding: 11px 16px; text-align: left; color: #526079; background: #f8fafc; border-bottom: 1px solid #d9dfe8; font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; white-space: nowrap; }
+td { padding: 13px 16px; border-bottom: 1px solid #e7ebf1; color: #526079; white-space: nowrap; }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover { background: #fafbfd; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+}

@@ -1,0 +1,35 @@
+# Local secrets
+.env
+.env.local
+.env.*.local
+backend/.env.local
+frontend/.env.local
+
+# Licensed/reference data
+LICENSED_CODEBOOK_DATA/
+reference_data/
+ortho_coding_reference_bundle/reference_data/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+backend/orthocode.db
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+
+# JavaScript
+node_modules/
+.next/
+out/
+frontend/.env.local
+
+# Local runtime artifacts
+.DS_Store
+artifacts/
+uploads/
+backend/.data/
+*.log

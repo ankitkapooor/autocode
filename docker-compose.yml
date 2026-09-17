@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: orthocode
+      POSTGRES_USER: orthocode
+      POSTGRES_PASSWORD: orthocode
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orthocode"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - orthocode_postgres:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: ./backend
+    environment:
+      APP_ENV: development
+      PHI_MODE: "false"
+      DATABASE_URL: postgresql+psycopg://orthocode:orthocode@postgres:5432/orthocode
+      REDIS_URL: redis://redis:6379/0
+      REFERENCE_DATA_PATH: /reference_data
+      ACTIVE_REFERENCE_RELEASE: 2026-Q3
+    volumes:
+      - ./ortho_coding_reference_bundle/reference_data:/reference_data:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: ./backend
+    command: python -m app.workers
+    environment:
+      APP_ENV: development
+      PHI_MODE: "false"
+      DATABASE_URL: postgresql+psycopg://orthocode:orthocode@postgres:5432/orthocode
+      REDIS_URL: redis://redis:6379/0
+      REFERENCE_DATA_PATH: /reference_data
+    volumes:
+      - ./ortho_coding_reference_bundle/reference_data:/reference_data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build: ./frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  orthocode_postgres:
