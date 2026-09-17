@@ -5,10 +5,10 @@
 backend/.env.local
 frontend/.env.local
 
-# Licensed/reference data
+# Licensed/reference data (application source under backend/app/reference_data is tracked)
 LICENSED_CODEBOOK_DATA/
-reference_data/
-ortho_coding_reference_bundle/reference_data/
+/reference_data/
+/ortho_coding_reference_bundle/reference_data/
 
 # Python
 __pycache__/
