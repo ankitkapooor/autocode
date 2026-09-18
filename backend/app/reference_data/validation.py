@@ -1,9 +1,36 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
+from typing import Any
 
 from app.reference_data.types import ParsedBundle, ValidationIssue
 from app.reference_data.utils import canonical_code
+
+
+def _deduplicate(
+    rows: list[dict[str, Any]], key: Callable[[dict[str, Any]], tuple[object, ...]]
+) -> tuple[list[dict[str, Any]], int]:
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[object, ...]] = set()
+    duplicates = 0
+    for row in rows:
+        identity = key(row)
+        if identity in seen:
+            duplicates += 1
+            continue
+        seen.add(identity)
+        unique.append(row)
+    return unique, duplicates
+
+
+def _duplicate_warning(code: str, label: str, count: int) -> ValidationIssue:
+    return ValidationIssue(
+        "warning",
+        code,
+        f"Removed {count:,} duplicate {label} rows",
+        context={"duplicates_removed": count},
+    )
 
 
 def validate_bundle(
@@ -12,40 +39,51 @@ def validate_bundle(
     """Validate and deterministically de-duplicate a parsed release."""
     issues: list[ValidationIssue] = []
 
-    unique_codes: list[dict[str, object]] = []
-    seen_codes: set[tuple[object, object, object, object]] = set()
-    duplicate_count = 0
-    for row in bundle.code_entries:
-        key = (
-            row.get("code_system"),
-            canonical_code(row.get("code")),
-            row.get("effective_from"),
-            row.get("effective_to"),
-        )
-        if key in seen_codes:
-            duplicate_count += 1
-            continue
-        seen_codes.add(key)
-        unique_codes.append(row)
-    bundle.code_entries = unique_codes
+    bundle.code_entries, duplicate_count = _deduplicate(
+        bundle.code_entries,
+        lambda row: (row.get("code_system"), canonical_code(row.get("code"))),
+    )
     if duplicate_count:
         issues.append(
-            ValidationIssue(
-                "warning",
-                "DUPLICATE_CANONICAL_CODES",
-                f"Removed {duplicate_count:,} duplicate canonical code rows",
-                context={"duplicates_removed": duplicate_count},
+            _duplicate_warning("DUPLICATE_CANONICAL_CODES", "canonical code", duplicate_count)
+        )
+
+    bundle.modifiers, duplicate_count = _deduplicate(
+        bundle.modifiers, lambda row: (canonical_code(row.get("modifier")),)
+    )
+    if duplicate_count:
+        issues.append(_duplicate_warning("DUPLICATE_MODIFIERS", "modifier", duplicate_count))
+
+    bundle.pfs_attributes, duplicate_count = _deduplicate(
+        bundle.pfs_attributes,
+        lambda row: (canonical_code(row.get("code")), row.get("modifier") or ""),
+    )
+    if duplicate_count:
+        issues.append(
+            _duplicate_warning(
+                "DUPLICATE_PFS_ATTRIBUTES", "PFS procedure attribute", duplicate_count
             )
         )
 
-    unique_modifiers: list[dict[str, object]] = []
-    seen_modifiers: set[tuple[object, object]] = set()
-    for row in bundle.modifiers:
-        key = (canonical_code(row.get("modifier")), row.get("effective_from"))
-        if key not in seen_modifiers:
-            seen_modifiers.add(key)
-            unique_modifiers.append(row)
-    bundle.modifiers = unique_modifiers
+    bundle.mue_edits, duplicate_count = _deduplicate(
+        bundle.mue_edits,
+        lambda row: (row.get("setting"), canonical_code(row.get("code"))),
+    )
+    if duplicate_count:
+        issues.append(_duplicate_warning("DUPLICATE_MUE_EDITS", "MUE edit", duplicate_count))
+
+    bundle.addon_relations, duplicate_count = _deduplicate(
+        bundle.addon_relations,
+        lambda row: (
+            canonical_code(row.get("addon_code")),
+            canonical_code(row.get("primary_code")),
+            row.get("effective_from"),
+        ),
+    )
+    if duplicate_count:
+        issues.append(
+            _duplicate_warning("DUPLICATE_ADDON_RELATIONS", "add-on relation", duplicate_count)
+        )
 
     systems = Counter(str(row.get("code_system")) for row in bundle.code_entries)
     if systems.get("CPT", 0) == 0:

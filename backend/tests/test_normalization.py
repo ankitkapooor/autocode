@@ -99,14 +99,49 @@ def test_cpt_current_format_parser_skips_license_preamble(tmp_path: Path) -> Non
 def test_validation_rejects_missing_ptp_and_deduplicates_codes() -> None:
     bundle = ParsedBundle(
         code_entries=[
-            {"id": "1", "code_system": "ICD10CM", "code": "M75.1", "code_key": "M751", "effective_from": date(2026, 1, 1), "effective_to": None},
-            {"id": "2", "code_system": "ICD10CM", "code": "M75.1", "code_key": "M751", "effective_from": date(2026, 1, 1), "effective_to": None},
-            {"id": "3", "code_system": "HCPCS", "code": "L1234", "code_key": "L1234", "effective_from": date(2026, 1, 1), "effective_to": None},
+            {
+                "id": "1",
+                "code_system": "ICD10CM",
+                "code": "M75.1",
+                "code_key": "M751",
+                "effective_from": date(2026, 1, 1),
+                "effective_to": None,
+            },
+            {
+                "id": "2",
+                "code_system": "ICD10CM",
+                "code": "M75.1",
+                "code_key": "M751",
+                "effective_from": date(2026, 1, 1),
+                "effective_to": None,
+            },
+            {
+                "id": "3",
+                "code_system": "HCPCS",
+                "code": "L1234",
+                "code_key": "L1234",
+                "effective_from": date(2026, 1, 1),
+                "effective_to": None,
+            },
         ],
-        pfs_attributes=[{"code_key": "29827", "effective_from": date(2026, 1, 1), "effective_to": None}],
+        pfs_attributes=[
+            {"code_key": "29827", "effective_from": date(2026, 1, 1), "effective_to": None}
+        ],
         mue_edits=[
-            {"setting": "practitioner", "code_key": "29827", "mue_value": 1, "effective_from": date(2026, 1, 1), "effective_to": None},
-            {"setting": "outpatient_hospital", "code_key": "29827", "mue_value": 1, "effective_from": date(2026, 1, 1), "effective_to": None},
+            {
+                "setting": "practitioner",
+                "code_key": "29827",
+                "mue_value": 1,
+                "effective_from": date(2026, 1, 1),
+                "effective_to": None,
+            },
+            {
+                "setting": "outpatient_hospital",
+                "code_key": "29827",
+                "mue_value": 1,
+                "effective_from": date(2026, 1, 1),
+                "effective_to": None,
+            },
         ],
         addon_relations=[{"effective_from": date(2026, 1, 1), "effective_to": None}],
         rule_documents=[{"id": "rule"}],
@@ -115,3 +150,39 @@ def test_validation_rejects_missing_ptp_and_deduplicates_codes() -> None:
     assert len(bundle.code_entries) == 2
     assert any(issue.code == "DUPLICATE_CANONICAL_CODES" for issue in issues)
     assert any(issue.code == "MISSING_NCCI_SETTING" for issue in issues)
+
+
+def test_validation_deduplicates_rows_to_match_database_constraints() -> None:
+    bundle = ParsedBundle(
+        pfs_attributes=[
+            {"code": "29827", "modifier": "", "source_file_id": "a"},
+            {"code": "29827", "modifier": "", "source_file_id": "b"},
+        ],
+        mue_edits=[
+            {"setting": "practitioner", "code": "29827", "mue_value": 1},
+            {"setting": "practitioner", "code": "29827", "mue_value": 1},
+        ],
+        addon_relations=[
+            {
+                "addon_code": "0767T",
+                "primary_code": "0766T",
+                "effective_from": date(2026, 7, 1),
+            },
+            {
+                "addon_code": "0767T",
+                "primary_code": "0766T",
+                "effective_from": date(2026, 7, 1),
+            },
+        ],
+    )
+
+    issues = validate_bundle(bundle, ncci_settings={"practitioner", "outpatient_hospital"})
+
+    assert len(bundle.pfs_attributes) == 1
+    assert len(bundle.mue_edits) == 1
+    assert len(bundle.addon_relations) == 1
+    assert {issue.code for issue in issues} >= {
+        "DUPLICATE_PFS_ATTRIBUTES",
+        "DUPLICATE_MUE_EDITS",
+        "DUPLICATE_ADDON_RELATIONS",
+    }
