@@ -3,13 +3,15 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from app.reference_data.ncci_index import NcciSourceIndex, build_ncci_source_index
 from app.reference_data.types import DiscoveredFile
 from app.reference_data.utils import sha256_file
 
 
 def test_compact_ncci_source_index_supports_directional_effective_date_lookup(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source_root = tmp_path / "reference_data"
     source_path = (
@@ -62,3 +64,16 @@ def test_compact_ncci_source_index_supports_directional_effective_date_lookup(
     prior = index.lookup("practitioner", "29827", "73030", date(2026, 9, 1))
     assert prior is not None
     assert prior.effective_from == date.min
+
+    def unexpected_rebuild(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("compatible index should be reused")
+
+    monkeypatch.setattr("app.reference_data.adapters.iter_ncci_ptp", unexpected_rebuild)
+    reused = build_ncci_source_index(
+        [discovered],
+        source_root,
+        index_path,
+        source_manifest_sha256="manifest-1",
+    )
+    assert reused["record_count"] == 4
+    assert reused["settings"] == ["practitioner"]

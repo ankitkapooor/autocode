@@ -56,6 +56,21 @@ def build_ncci_source_index(
 ) -> dict[str, Any]:
     del source_root  # Paths are deliberately not copied into the runtime index.
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.is_file():
+        try:
+            existing = NcciSourceIndex(output_path, output_path.parent)
+        except (OSError, ValueError, sqlite3.DatabaseError):
+            existing = None
+        if existing is not None and existing.is_compatible(source_manifest_sha256):
+            logger.info("Reusing completed NCCI index: %s rows", f"{existing.record_count:,}")
+            return {
+                "format": "sqlite",
+                "record_count": existing.record_count,
+                "file_size": output_path.stat().st_size,
+                "path": str(output_path),
+                "source_manifest_sha256": source_manifest_sha256,
+                "settings": existing.settings,
+            }
     temporary_path = output_path.with_name(f"{output_path.name}.tmp")
     temporary_path.unlink(missing_ok=True)
     connection = sqlite3.connect(temporary_path)
@@ -96,7 +111,7 @@ def build_ncci_source_index(
                 connection.executemany(insert_sql, batch)
                 batch.clear()
             if record_count % PROGRESS_INTERVAL == 0:
-                logger.info("NCCI index: %,d rows processed", record_count)
+                logger.info("NCCI index: %s rows processed", f"{record_count:,}")
         if batch:
             connection.executemany(insert_sql, batch)
         logger.info("NCCI rows loaded; creating lookup index")
@@ -123,7 +138,7 @@ def build_ncci_source_index(
         raise
     connection.close()
     temporary_path.replace(output_path)
-    logger.info("NCCI index complete: %,d rows", record_count)
+    logger.info("NCCI index complete: %s rows", f"{record_count:,}")
     return {
         "format": "sqlite",
         "record_count": record_count,
@@ -140,6 +155,9 @@ class NcciSourceIndex:
         self.source_root = source_root
         with sqlite3.connect(path) as connection:
             metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            self.settings = sorted(
+                row[0] for row in connection.execute("SELECT DISTINCT setting FROM ncci_edits")
+            )
         self.version = int(metadata.get("version", "0"))
         self.source_manifest_sha256 = metadata.get("source_manifest_sha256", "")
         self.record_count = int(metadata.get("record_count", "0"))
