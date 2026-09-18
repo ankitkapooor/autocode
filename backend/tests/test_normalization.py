@@ -43,6 +43,61 @@ def test_icd10cm_parser_preserves_hierarchy_and_leaf_status(tmp_path: Path) -> N
     assert by_code["M75.102"]["effective_from"] == date(2026, 4, 1)
 
 
+def test_icd10cm_order_file_expands_billable_seventh_character_codes(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "icd10cm-xml.zip"
+    xml = """<?xml version='1.0'?>
+    <ICD10CM.tabular><version>2026</version><chapter><name>19</name><desc>Injury</desc>
+    <section><diag><name>S83</name><desc>Injury of knee</desc>
+    <diag><name>S83.512</name><desc>Sprain of ACL of left knee</desc></diag>
+    </diag></section></chapter></ICD10CM.tabular>"""
+    with ZipFile(archive, "w") as bundle:
+        bundle.writestr("icd10c-tabular-April-1-2026.xml", xml)
+    order_file = tmp_path / "icd10cm-order-April-1-2026.txt"
+
+    def order_row(order: int, code: str, billable: bool, description: str) -> str:
+        return (
+            f"{order:05d} {code:<7} {int(billable)} "
+            f"{description[:60]:<60} {description}"
+        )
+
+    order_file.write_text(
+        "\n".join(
+            [
+                order_row(1, "S83512", False, "Sprain of ACL of left knee"),
+                order_row(
+                    2,
+                    "S83512A",
+                    True,
+                    "Sprain of ACL of left knee, initial encounter",
+                ),
+                order_row(
+                    3,
+                    "S83512D",
+                    True,
+                    "Sprain of ACL of left knee, subsequent encounter",
+                ),
+                order_row(4, "S83512S", True, "Sprain of ACL of left knee, sequela"),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    parsed = parse_icd10cm(
+        [discovered(archive, "icd10cm"), discovered(order_file, "icd10cm")],
+        date(2026, 7, 1),
+    )
+    by_code = {row["code"]: row for row in parsed.code_entries}
+
+    assert by_code["S83.512"]["billable"] is False
+    assert by_code["S83.512A"]["billable"] is True
+    assert by_code["S83.512A"]["parent_code"] == "S83.512"
+    assert by_code["S83.512A"]["chapter"] == "Injury"
+    assert by_code["S83.512D"]["billable"] is True
+    assert by_code["S83.512S"]["billable"] is True
+
+
 def test_hcpcs_parser_excludes_numeric_level_one_rows(tmp_path: Path) -> None:
     archive = tmp_path / "hcpcs.zip"
 

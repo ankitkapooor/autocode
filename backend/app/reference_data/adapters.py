@@ -161,6 +161,48 @@ def _table_rows(source: DiscoveredFile, name: str, payload: bytes) -> Iterator[d
         yield _normalized(row)
 
 
+def _formatted_icd10cm_code(code_key: str) -> str:
+    return f"{code_key[:3]}.{code_key[3:]}" if len(code_key) > 3 else code_key
+
+
+def _icd10cm_order_rows(
+    files: list[DiscoveredFile], effective_from: date
+) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for source, name, payload in _payloads(files, {".txt"}):
+        lower_name = name.lower()
+        if "order" not in lower_name or "addenda" in lower_name:
+            continue
+        release_date = date_from_name(name, source.effective_from or effective_from)
+        for line in _text(payload).splitlines():
+            if len(line) < 17 or not line[:5].strip().isdigit():
+                continue
+            code_key = canonical_code(line[6:13])
+            header = line[14:15]
+            if not re.fullmatch(r"[A-Z][0-9A-Z]{2,6}", code_key) or header not in {"0", "1"}:
+                continue
+            rows.setdefault(
+                code_key,
+                {
+                    "code_system": "ICD10CM",
+                    "code": _formatted_icd10cm_code(code_key),
+                    "code_key": code_key,
+                    "short_description": line[16:76].strip() or None,
+                    "long_description": line[77:].strip() or line[16:76].strip() or None,
+                    "effective_from": release_date,
+                    "effective_to": None,
+                    "billable": header == "1",
+                    "category": code_key[:3],
+                    "chapter": None,
+                    "parent_code": None,
+                    "metadata_json": {"authoritative_source": "icd10cm_order_file"},
+                    "source_version": str(release_date.year),
+                    "source_file_id": source.id,
+                },
+            )
+    return rows
+
+
 def parse_icd10cm(files: list[DiscoveredFile], effective_from: date) -> ParsedBundle:
     result = ParsedBundle()
     for source, name, payload in _payloads(files, {".xml"}):
@@ -243,6 +285,24 @@ def parse_icd10cm(files: list[DiscoveredFile], effective_from: date) -> ParsedBu
                     for parent in chapter.iter()
                 ):
                     visit(item)
+    order_rows = _icd10cm_order_rows(files, effective_from)
+    entries_by_key = {str(row["code_key"]): row for row in result.code_entries}
+    for code_key, order_row in order_rows.items():
+        existing = entries_by_key.get(code_key)
+        if existing is not None:
+            existing["billable"] = order_row["billable"]
+            continue
+        parent_key = code_key[:-1]
+        while len(parent_key) >= 3 and parent_key not in entries_by_key:
+            parent_key = parent_key[:-1]
+        parent = entries_by_key.get(parent_key)
+        row = {
+            **order_row,
+            "parent_code": parent.get("code") if parent is not None else None,
+            "chapter": parent.get("chapter") if parent is not None else None,
+        }
+        result.code_entries.append(row)
+        entries_by_key[code_key] = row
     if not result.code_entries:
         result.issues.append(
             _issue(
