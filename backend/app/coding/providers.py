@@ -127,7 +127,9 @@ class OpenAIClinicalProvider:
                 "through the assertion field. Never infer an undocumented diagnosis, procedure, "
                 "laterality, approach, device, medication, or quantity. "
                 "Every fact must cite one or more exact evidence_span_ids. Produce concise retrieval queries "
-                "for CPT and ICD-10-CM candidate search; do not assign codes in this stage."
+                "for CPT and ICD-10-CM candidate search; do not assign codes in this stage. For each "
+                "performed procedure, include at least one query using standardized codebook-descriptor "
+                "terminology in addition to the chart's own wording."
             ),
             payload=payload,
             max_output_tokens=5000,

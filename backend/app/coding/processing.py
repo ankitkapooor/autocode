@@ -824,6 +824,7 @@ class ChartProcessor:
                 )
                 continue
             for candidate in scoped:
+                coding_guidance = _candidate_coding_guidance(candidate)
                 key = decision_key(
                     fact.fact_type,
                     "candidate",
@@ -838,6 +839,7 @@ class ChartProcessor:
                         f"'{fact.normalized_value or fact.value}' directly support separately "
                         f"reporting active billable {candidate.code_system} {candidate.code} "
                         f"({candidate.description or 'no description'}) for this encounter?"
+                        f"{coding_guidance}"
                     ),
                     "criteria": {
                         "true": (
@@ -1856,6 +1858,45 @@ _RETRIEVAL_STOPWORDS = {
     "with",
 }
 
+_ORTHOPEDIC_RETRIEVAL_ALIASES = (
+    (
+        re.compile(r"\bcarpal tunnel\b.*\brelease\b|\brelease\b.*\bcarpal tunnel\b", re.I),
+        "neuroplasty transposition median nerve carpal tunnel",
+    ),
+    (
+        re.compile(r"\bcubital tunnel\b.*\brelease\b|\bulnar nerve\b.*\bdecompression\b", re.I),
+        "neuroplasty transposition ulnar nerve elbow",
+    ),
+    (
+        re.compile(r"\btrigger finger\b.*\brelease\b|\ba1 pulley\b.*\brelease\b", re.I),
+        "tendon sheath incision trigger finger",
+    ),
+    (
+        re.compile(r"\b(?:acl|anterior cruciate ligament)\b.*\breconstruction\b", re.I),
+        "arthroscopically aided anterior cruciate ligament repair augmentation reconstruction",
+    ),
+    (
+        re.compile(r"\brotator cuff\b.*\brepair\b", re.I),
+        "arthroscopy shoulder surgical rotator cuff repair",
+    ),
+    (
+        re.compile(r"\bmeniscectomy\b", re.I),
+        "arthroscopy knee surgical meniscectomy medial lateral",
+    ),
+    (
+        re.compile(r"\btotal hip\b.*\b(?:arthroplasty|replacement)\b", re.I),
+        "arthroplasty acetabular proximal femoral prosthetic replacement total hip",
+    ),
+    (
+        re.compile(r"\btotal knee\b.*\b(?:arthroplasty|replacement)\b", re.I),
+        "arthroplasty knee condyle plateau medial lateral compartments",
+    ),
+    (
+        re.compile(r"\bdistal radius\b.*\b(?:fixation|orif|open reduction)\b", re.I),
+        "open treatment distal radial fracture internal fixation",
+    ),
+)
+
 
 def _retrieval_tokens(value: str) -> set[str]:
     aliases = {"arthroscopic": "arthroscopy", "osteoarthritic": "osteoarthritis"}
@@ -1874,6 +1915,12 @@ def _fact_retrieval_terms(
 ) -> list[str]:
     primary_values = [fact.normalized_value or "", fact.value]
     related_values = _related_fact_values(fact, facts)
+    retrieval_context = " ".join([*primary_values, *related_values])
+    aliases = [
+        alias
+        for pattern, alias in _ORTHOPEDIC_RETRIEVAL_ALIASES
+        if pattern.search(retrieval_context)
+    ]
     scope_tokens = _retrieval_tokens(" ".join([*primary_values, *related_values]))
     associated_queries: list[str] = []
     for query in queries:
@@ -1885,7 +1932,7 @@ def _fact_retrieval_terms(
     contextual = " ".join(
         item for item in [primary_values[0], *related_values] if item
     )[:160]
-    values = [contextual, *associated_queries, *primary_values, *related_values]
+    values = [contextual, *aliases, *associated_queries, *primary_values, *related_values]
     return [
         value
         for value in dict.fromkeys(" ".join(str(item).split())[:160] for item in values)
@@ -1927,6 +1974,25 @@ def _candidate_systems_for_fact(fact: ClinicalFact) -> tuple[str, ...]:
     if fact.fact_type in {"medication", "device"}:
         return ("HCPCS",)
     return ("CPT", "HCPCS")
+
+
+def _candidate_coding_guidance(candidate: CandidateCode) -> str:
+    if candidate.code_system != "ICD10CM":
+        return ""
+    code_key = canonical_code(candidate.code)
+    description = (candidate.description or "").lower()
+    guidance: list[str] = []
+    if code_key.startswith("S") and code_key.endswith("A"):
+        guidance.append(
+            "For ICD-10-CM injury codes, seventh character A denotes active treatment, "
+            "including surgical treatment; it does not require a first-ever visit."
+        )
+    if "ligament" in description and "sprain" in description:
+        guidance.append(
+            "In ICD-10-CM injury terminology, a documented ligament tear or rupture is "
+            "represented in the corresponding ligament sprain category."
+        )
+    return f" Coding guidance: {' '.join(guidance)}" if guidance else ""
 
 
 def _noul_status(probability: float | None, accept_threshold: float) -> tuple[str, bool]:

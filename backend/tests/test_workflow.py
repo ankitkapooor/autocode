@@ -557,6 +557,128 @@ def test_jev_primary_can_select_multiple_supported_codes_for_one_fact(
     assert result.jev_output["summary"]["codes_selected"] == 2
 
 
+def test_jev_primary_bridges_open_carpal_tunnel_to_cpt_descriptor(
+    session, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "An open left carpal tunnel release was performed."
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {
+                "code": "64721",
+                "description": "Neuroplasty and/or transposition; median nerve at carpal tunnel",
+            },
+            {
+                "code": "29848",
+                "description": (
+                    "Endoscopy, wrist, surgical, with release of transverse carpal ligament"
+                ),
+            },
+        ],
+    )
+    provider = FakeProvider(
+        facts=[
+            {
+                "fact_type": "procedure",
+                "value": "Open release of left carpal tunnel",
+                "normalized_value": "open left carpal tunnel release",
+                "assertion": "present",
+                "confidence": 0.99,
+            }
+        ],
+        search_queries=["open left carpal tunnel release"],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(code_by_fact={"carpal tunnel": "64721"})
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert [line.code for line in result.lines] == ["64721"]
+    candidate = session.query(CandidateCode).filter_by(code="64721").one()
+    assert "median nerve" in candidate.description.lower()
+
+
+def test_jev_primary_receives_icd_injury_and_initial_encounter_guidance(
+    session, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "An acute complete left ACL rupture received operative treatment today."
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {"code": "00000", "description": "Licensed CPT gate placeholder"},
+            {
+                "code_system": "ICD10CM",
+                "code": "S83.512",
+                "description": "Sprain of anterior cruciate ligament of left knee",
+                "billable": False,
+            },
+            {
+                "code_system": "ICD10CM",
+                "code": "S83.512A",
+                "description": (
+                    "Sprain of anterior cruciate ligament of left knee, initial encounter"
+                ),
+            },
+            {
+                "code_system": "ICD10CM",
+                "code": "S83.512D",
+                "description": (
+                    "Sprain of anterior cruciate ligament of left knee, subsequent encounter"
+                ),
+            },
+        ],
+    )
+    provider = FakeProvider(
+        facts=[
+            {
+                "fact_type": "diagnosis",
+                "value": "Acute complete rupture of anterior cruciate ligament of left knee",
+                "normalized_value": "acute complete left ACL rupture",
+                "assertion": "present",
+                "confidence": 0.99,
+            }
+        ],
+        search_queries=["anterior cruciate ligament rupture left knee"],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(code_by_fact={"acute complete left acl rupture": "S83.512A"})
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert [line.code for line in result.lines] == ["S83.512A"]
+    question = next(
+        question
+        for batch in jev.question_batches
+        for key, question in batch.items()
+        if "_candidate_" in key and "S83.512A" in question["instructions"]
+    )
+    assert "active treatment" in question["instructions"]
+    assert "tear or rupture" in question["instructions"]
+    assert session.query(CandidateCode).filter_by(code="S83.512").count() == 0
+
+
 def test_jev_candidate_decisions_are_sent_in_bounded_batches(
     session, tmp_path: Path
 ) -> None:  # type: ignore[no-untyped-def]
