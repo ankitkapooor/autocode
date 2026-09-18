@@ -581,6 +581,105 @@ def test_jev_primary_retrieves_total_hip_and_diagnosis_from_independent_fact_poo
     assert all(not option.startswith("CPT") for option in diagnosis_options)
 
 
+def test_jev_primary_uses_evidence_linked_diagnosis_to_retrieve_trigger_release_cpt(
+    session, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = (
+        "Open right middle finger A1 pulley release was performed for stenosing "
+        "tenosynovitis, also called trigger finger."
+    )
+    distractors = [
+        ("26210", "Excision of benign tumor of middle phalanx of finger"),
+        ("26215", "Excision of benign tumor of middle phalanx of finger with autograft"),
+        ("26235", "Partial excision of proximal or middle phalanx of finger"),
+        ("26260", "Radical resection of tumor of middle phalanx of finger"),
+        ("26720", "Closed treatment of middle phalanx finger fracture without manipulation"),
+        ("26725", "Closed treatment of middle phalanx finger fracture with manipulation"),
+        ("26727", "Percutaneous fixation of middle phalanx finger fracture"),
+        ("26735", "Open treatment of middle phalanx finger fracture"),
+        ("00120", "Anesthesia for procedures on external middle and inner ear"),
+        ("00124", "Anesthesia for procedures on middle ear with otoscopy"),
+        ("00126", "Anesthesia for procedures on middle ear with tympanotomy"),
+        ("26455", "Tenotomy flexor finger open each tendon"),
+        ("26460", "Tenotomy extensor hand or finger open each tendon"),
+        ("15002", "Surgical preparation of open wounds trunk arms or legs"),
+        ("15003", "Surgical preparation additional open wound surface area"),
+        ("15004", "Surgical preparation of open wounds hands or feet"),
+        ("15005", "Surgical preparation additional hand or foot wound area"),
+        ("81404", "Molecular pathology procedure level 5"),
+        ("81406", "Molecular pathology procedure level 7"),
+        ("26160", "Excision of lesion of tendon sheath hand or finger"),
+        ("26715", "Closed treatment of finger articular fracture"),
+    ]
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {"code": code, "description": description} for code, description in distractors
+        ]
+        + [
+            {"code": "26055", "description": "Tendon sheath incision for trigger finger"},
+            {
+                "code_system": "ICD10CM",
+                "code": "M65.331",
+                "description": "Trigger finger right middle finger",
+            },
+        ],
+    )
+    provider = FakeProvider(
+        facts=[
+            {
+                "fact_type": "procedure",
+                "value": "Open right middle finger A1 pulley release",
+                "normalized_value": "A1 pulley release of middle finger",
+                "assertion": "present",
+                "confidence": 1.0,
+            },
+            {
+                "fact_type": "diagnosis",
+                "value": "Stenosing tenosynovitis trigger finger right middle finger",
+                "normalized_value": "Trigger finger of right middle finger",
+                "assertion": "present",
+                "confidence": 1.0,
+            },
+        ],
+        search_queries=["A1 pulley release right middle finger"],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(
+        code_by_fact={"a1 pulley release": "26055", "trigger finger": "M65.331"}
+    )
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert provider.select_calls == 0
+    assert "26055" in {line.code for line in result.lines}
+    procedure_question = next(
+        question
+        for batch in jev.question_batches
+        for key, question in batch.items()
+        if "procedure_code_" in key
+    )
+    assert "candidate_cpt_26055" in procedure_question["criteria"]
+    procedure_decision = next(
+        item
+        for item in result.jev_output["code_selections"]
+        if item["fact_type"] == "procedure"
+    )
+    assert procedure_decision["code"] == "26055"
+    assert procedure_decision["abstained"] is False
+
+
 def test_jev_primary_code_choices_use_only_the_generating_facts_candidate_pool(
     session, tmp_path: Path
 ) -> None:  # type: ignore[no-untyped-def]

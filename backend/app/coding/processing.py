@@ -433,23 +433,49 @@ class ChartProcessor:
             and fact.fact_type in {"diagnosis", "procedure", "device", "medication"}
         ]
         fact_search_terms = {
-            fact.id: _fact_retrieval_terms(fact, queries, len(codable_facts))
+            fact.id: _fact_retrieval_terms(fact, facts, queries, len(codable_facts))
             for fact in codable_facts
         }
         entries: dict[tuple[str, str], tuple[CodeEntry, str]] = {}
         fact_keys: dict[str, list[tuple[str, str]]] = {fact.id: [] for fact in codable_facts}
         global_keys: list[tuple[str, str]] = []
 
-        def remember(entry: CodeEntry, term: str, *, fact_id: str | None = None) -> None:
+        def remember_global(entry: CodeEntry, term: str) -> None:
             key = (entry.code_system, entry.code_key)
             entries.setdefault(key, (entry, term))
-            target = fact_keys[fact_id] if fact_id is not None else global_keys
-            if key not in target:
-                target.append(key)
+            if key not in global_keys:
+                global_keys.append(key)
 
         for fact in codable_facts:
             systems = _candidate_systems_for_fact(fact)
-            for term in fact_search_terms[fact.id]:
+            hits: dict[tuple[str, str], dict[str, Any]] = {}
+
+            def score_hit(
+                entry: CodeEntry,
+                term: str,
+                score: float,
+                result_rank: int,
+            ) -> None:
+                key = (entry.code_system, entry.code_key)
+                entries.setdefault(key, (entry, term))
+                hit = hits.setdefault(
+                    key,
+                    {
+                        "entry": entry,
+                        "score": 0.0,
+                        "best_rank": result_rank,
+                        "query": term,
+                        "best_contribution": -1.0,
+                    },
+                )
+                hit["score"] += score
+                hit["best_rank"] = min(hit["best_rank"], result_rank)
+                if score > hit["best_contribution"]:
+                    hit["query"] = term
+                    hit["best_contribution"] = score
+
+            for term_index, term in enumerate(fact_search_terms[fact.id]):
+                term_weight = 3.0 if term_index == 0 else 1.0
                 direct_codes = re.findall(
                     r"\b(?:[A-TV-Z][0-9][0-9A-Z.]{2,6}|\d{4}[FMTU]?|\d{5})\b",
                     term,
@@ -459,20 +485,38 @@ class ChartProcessor:
                     for system in systems:
                         entry = repository.get_code(system, code, service_date)
                         if entry is not None:
-                            remember(entry, code.upper(), fact_id=fact.id)
+                            score_hit(entry, code.upper(), 100.0, 0)
                 if len(term) < 3:
                     continue
                 for system in systems:
-                    for entry in repository.search_codes(
-                        term, system=system, service_date=service_date, limit=12
-                    ):
-                        remember(entry, term, fact_id=fact.id)
-                        if len(fact_keys[fact.id]) >= 20:
-                            break
-                    if len(fact_keys[fact.id]) >= 20:
-                        break
-                if len(fact_keys[fact.id]) >= 20:
-                    break
+                    matches = repository.search_codes(
+                        term, system=system, service_date=service_date, limit=20
+                    )
+                    for result_rank, entry in enumerate(matches):
+                        score_hit(
+                            entry,
+                            term,
+                            term_weight / (result_rank + 1),
+                            result_rank,
+                        )
+
+            system_order = {system: index for index, system in enumerate(systems)}
+            ranked_hits = sorted(
+                hits.values(),
+                key=lambda hit: (
+                    -float(hit["score"]),
+                    int(hit["best_rank"]),
+                    system_order.get(hit["entry"].code_system, len(system_order)),
+                    hit["entry"].code,
+                ),
+            )
+            fact_keys[fact.id] = [
+                (hit["entry"].code_system, hit["entry"].code_key)
+                for hit in ranked_hits[:20]
+            ]
+            for hit in ranked_hits[:20]:
+                key = (hit["entry"].code_system, hit["entry"].code_key)
+                entries[key] = (hit["entry"], str(hit["query"]))
 
         # Preserve the legacy global retrieval surface for rollback/shadow output. These
         # candidates are persisted, but are never added to another fact's JEV choice.
@@ -489,7 +533,7 @@ class ChartProcessor:
                 for entry in repository.search_codes(
                     term, system=system, service_date=service_date, limit=4
                 ):
-                    remember(entry, term)
+                    remember_global(entry, term)
 
         # Retain the existing global cap while allocating candidates round-robin so a
         # noisy first fact cannot exhaust the pool before later facts are represented.
@@ -772,9 +816,10 @@ class ChartProcessor:
                     }
                 )
                 continue
+            options = {_candidate_choice_key(item): item for item in scoped}
             criteria: dict[str, str] = {
-                f"candidate_{index}": f"{item.code_system} {item.code}: {item.description or ''}"
-                for index, item in enumerate(scoped)
+                option: f"{item.code_system} {item.code}: {item.description or ''}"
+                for option, item in options.items()
             }
             criteria["NONE"] = "No supplied candidate is supported by the evidence."
             criteria["INSUFFICIENT_DOCUMENTATION"] = (
@@ -791,9 +836,7 @@ class ChartProcessor:
             }
             metadata[key] = {
                 "fact": fact,
-                "options": {
-                    f"candidate_{index}": item for index, item in enumerate(scoped)
-                },
+                "options": options,
             }
         selection_state = self._jev_state(chart, validated_facts, spans)
         selection_state["candidate_groups"] = {
@@ -1777,22 +1820,57 @@ def _retrieval_tokens(value: str) -> set[str]:
 
 def _fact_retrieval_terms(
     fact: ClinicalFact,
+    facts: list[ClinicalFact],
     queries: list[str],
     codable_fact_count: int,
 ) -> list[str]:
-    values = [fact.normalized_value or "", fact.value]
-    fact_tokens = _retrieval_tokens(" ".join(values))
+    primary_values = [fact.normalized_value or "", fact.value]
+    related_values = _related_fact_values(fact, facts)
+    scope_tokens = _retrieval_tokens(" ".join([*primary_values, *related_values]))
+    associated_queries: list[str] = []
     for query in queries:
         cleaned = " ".join(str(query).split())[:160]
         if not cleaned:
             continue
-        if codable_fact_count == 1 or fact_tokens & _retrieval_tokens(cleaned):
-            values.append(cleaned)
+        if codable_fact_count == 1 or scope_tokens & _retrieval_tokens(cleaned):
+            associated_queries.append(cleaned)
+    contextual = " ".join(
+        item for item in [primary_values[0], *related_values] if item
+    )[:160]
+    values = [contextual, *associated_queries, *primary_values, *related_values]
     return [
         value
         for value in dict.fromkeys(" ".join(str(item).split())[:160] for item in values)
         if len(value) >= 3
     ][:20]
+
+
+def _related_fact_values(fact: ClinicalFact, facts: list[ClinicalFact]) -> list[str]:
+    related_type_order = {
+        "procedure": ("diagnosis", "anatomy", "approach", "laterality"),
+        "diagnosis": ("anatomy", "laterality"),
+        "device": ("procedure", "anatomy", "approach"),
+        "medication": ("procedure", "anatomy", "quantity"),
+    }.get(fact.fact_type, ())
+    type_rank = {fact_type: index for index, fact_type in enumerate(related_type_order)}
+    evidence_ids = set(fact.evidence_span_ids)
+    related_facts = sorted(
+        (
+            related
+            for related in facts
+            if related.id != fact.id
+            and related.fact_type in type_rank
+            and related.assertion == "present"
+            and evidence_ids.intersection(related.evidence_span_ids)
+        ),
+        key=lambda related: type_rank[related.fact_type],
+    )
+    return list(
+        dict.fromkeys(
+            related.normalized_value or related.value
+            for related in related_facts
+        )
+    )
 
 
 def _candidate_systems_for_fact(fact: ClinicalFact) -> tuple[str, ...]:
@@ -1801,6 +1879,10 @@ def _candidate_systems_for_fact(fact: ClinicalFact) -> tuple[str, ...]:
     if fact.fact_type in {"medication", "device"}:
         return ("HCPCS",)
     return ("CPT", "HCPCS")
+
+
+def _candidate_choice_key(candidate: CandidateCode) -> str:
+    return decision_key("candidate", candidate.code_system, canonical_code(candidate.code))
 
 
 def _candidate_payload(candidate: CandidateCode) -> dict[str, Any]:
