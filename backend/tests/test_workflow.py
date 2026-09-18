@@ -126,15 +126,19 @@ class ScriptedJevProvider:
         *,
         fact_classes: dict[str, str] | None = None,
         code_by_fact: dict[str, str] | None = None,
+        abstain_for: set[str] | None = None,
         unavailable: bool = False,
     ):
         self.fact_classes = fact_classes or {}
         self.code_by_fact = code_by_fact or {}
+        self.abstain_for = abstain_for or set()
         self.unavailable = unavailable
         self.calls: list[set[str]] = []
+        self.question_batches: list[dict[str, dict]] = []
 
     def decide(self, state, questions):  # type: ignore[no-untyped-def]
         self.calls.append(set(questions))
+        self.question_batches.append(questions)
         if self.unavailable:
             return {
                 "provider": self.name,
@@ -161,22 +165,25 @@ class ScriptedJevProvider:
                         ),
                     )
                 else:
-                    target = next(
-                        (
-                            code
-                            for phrase, code in self.code_by_fact.items()
-                            if phrase.lower() in instructions
-                        ),
-                        None,
-                    )
-                    choice = next(
-                        (
-                            option
-                            for option, description in criteria.items()
-                            if target and f" {target}:" in description
-                        ),
-                        next(option for option in criteria if option.startswith("candidate_")),
-                    )
+                    if any(phrase.lower() in instructions for phrase in self.abstain_for):
+                        choice = "NONE"
+                    else:
+                        target = next(
+                            (
+                                code
+                                for phrase, code in self.code_by_fact.items()
+                                if phrase.lower() in instructions
+                            ),
+                            None,
+                        )
+                        choice = next(
+                            (
+                                option
+                                for option, description in criteria.items()
+                                if target and f" {target}:" in description
+                            ),
+                            next(option for option in criteria if option.startswith("candidate_")),
+                        )
                 answers[key] = {
                     "type": "choice",
                     "choice": choice,
@@ -484,6 +491,266 @@ def test_jev_primary_calls_extraction_but_never_openai_code_selection(session, t
     assert candidate.selected is True
     assert candidate.model_confidence == 0.96
     assert result.jev_output["mode"] == "primary"
+
+
+def test_jev_primary_retrieves_total_hip_and_diagnosis_from_independent_fact_pools(
+    session, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "Left total hip arthroplasty was performed for primary osteoarthritis of the left hip."
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {
+                "code": "27130",
+                "description": "Arthroplasty acetabular and proximal femoral prosthetic replacement total hip",
+            },
+            {"code": "27125", "description": "Hip hemiarthroplasty prosthetic replacement"},
+            {"code": "27447", "description": "Total knee arthroplasty"},
+            {"code": "27236", "description": "Open treatment femoral fracture proximal end"},
+            {
+                "code_system": "ICD10CM",
+                "code": "M16.12",
+                "description": "Unilateral primary osteoarthritis left hip",
+            },
+            {
+                "code_system": "ICD10CM",
+                "code": "M17.12",
+                "description": "Unilateral primary osteoarthritis left knee",
+            },
+            {
+                "code_system": "ICD10CM",
+                "code": "M25.552",
+                "description": "Pain in left hip",
+            },
+        ],
+    )
+    provider = FakeProvider(
+        facts=[
+            {
+                "fact_type": "procedure",
+                "value": "left total hip arthroplasty",
+                "normalized_value": "total hip arthroplasty",
+                "assertion": "present",
+                "confidence": 0.99,
+            },
+            {
+                "fact_type": "diagnosis",
+                "value": "primary osteoarthritis of the left hip",
+                "normalized_value": "primary osteoarthritis left hip",
+                "assertion": "present",
+                "confidence": 0.99,
+            },
+        ],
+        search_queries=["total hip replacement", "primary osteoarthritis left hip"],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(
+        code_by_fact={"total hip arthroplasty": "27130", "osteoarthritis": "M16.12"}
+    )
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert provider.select_calls == 0
+    assert {line.code for line in result.lines} == {"27130", "M16.12"}
+    code_questions = {
+        question["instructions"]: set(question["criteria"].values())
+        for batch in jev.question_batches
+        for key, question in batch.items()
+        if "_code_" in key
+    }
+    procedure_options = next(
+        options for instructions, options in code_questions.items() if "total hip arthroplasty" in instructions
+    )
+    diagnosis_options = next(
+        options for instructions, options in code_questions.items() if "osteoarthritis" in instructions
+    )
+    assert any("CPT 27130:" in option for option in procedure_options)
+    assert all(not option.startswith("ICD10CM") for option in procedure_options)
+    assert any("ICD10CM M16.12:" in option for option in diagnosis_options)
+    assert all(not option.startswith("CPT") for option in diagnosis_options)
+
+
+def test_jev_primary_code_choices_use_only_the_generating_facts_candidate_pool(
+    session, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = (
+        "Arthroscopic rotator cuff repair and acromioplasty were performed. "
+        "The active diagnoses were right rotator cuff tear and shoulder impingement."
+    )
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {"code": "29827", "description": "Rotator cuff repair"},
+            {"code": "29826", "description": "Acromioplasty decompression"},
+            {"code": "29824", "description": "Distal claviculectomy"},
+            {"code": "23412", "description": "Open chronic rotator cuff repair"},
+            {
+                "code_system": "ICD10CM",
+                "code": "M75.121",
+                "description": "Complete right rotator cuff tear",
+            },
+            {
+                "code_system": "ICD10CM",
+                "code": "M75.41",
+                "description": "Impingement syndrome right shoulder",
+            },
+            {
+                "code_system": "ICD10CM",
+                "code": "M19.011",
+                "description": "Primary osteoarthritis right shoulder",
+            },
+        ],
+    )
+    provider = FakeProvider(
+        facts=[
+            {"fact_type": "procedure", "value": "arthroscopic rotator cuff repair", "normalized_value": "rotator cuff repair", "assertion": "present", "confidence": 0.99},
+            {"fact_type": "procedure", "value": "arthroscopic acromioplasty", "normalized_value": "acromioplasty", "assertion": "present", "confidence": 0.99},
+            {"fact_type": "diagnosis", "value": "right rotator cuff tear", "normalized_value": "right rotator cuff tear", "assertion": "present", "confidence": 0.99},
+            {"fact_type": "diagnosis", "value": "right shoulder impingement", "normalized_value": "right shoulder impingement", "assertion": "present", "confidence": 0.99},
+        ],
+        search_queries=[
+            "rotator cuff repair",
+            "acromioplasty decompression",
+            "right rotator cuff tear",
+            "right shoulder impingement",
+        ],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(
+        code_by_fact={
+            "procedure fact 'rotator cuff repair'": "29827",
+            "procedure fact 'acromioplasty'": "29826",
+            "diagnosis fact 'right rotator cuff tear'": "M75.121",
+            "diagnosis fact 'right shoulder impingement'": "M75.41",
+        }
+    )
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert {line.code for line in result.lines} == {"29827", "29826", "M75.121", "M75.41"}
+    code_questions = [
+        question
+        for batch in jev.question_batches
+        for key, question in batch.items()
+        if "_code_" in key
+    ]
+    assert len(code_questions) == 4
+    expected = {
+        "rotator cuff repair": "29827",
+        "acromioplasty": "29826",
+        "right rotator cuff tear": "M75.121",
+        "right shoulder impingement": "M75.41",
+    }
+    for phrase, code in expected.items():
+        question = next(item for item in code_questions if phrase in item["instructions"])
+        candidate_options = [
+            value
+            for key, value in question["criteria"].items()
+            if key.startswith("candidate_")
+        ]
+        assert candidate_options
+        assert any(f" {code}:" in option for option in candidate_options)
+        if code.startswith("M"):
+            assert all(option.startswith("ICD10CM") for option in candidate_options)
+        else:
+            assert all(option.startswith(("CPT", "HCPCS")) for option in candidate_options)
+
+
+def test_jev_primary_records_zero_candidate_fact_without_empty_choice(
+    session, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "A rare unsupported reconstruction was performed."
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[{"code": "00000", "description": "Licensed coding gate placeholder"}],
+    )
+    provider = FakeProvider(
+        facts=[
+            {"fact_type": "procedure", "value": "rare unsupported reconstruction", "normalized_value": "rare unsupported reconstruction", "assertion": "present", "confidence": 0.99}
+        ],
+        search_queries=["rare unsupported reconstruction"],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider()
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    warning = next(item for item in result.warnings if item["code"] == "NO_CANDIDATES_FOR_FACT")
+    assert warning["fact_id"]
+    assert warning["fact"] == "rare unsupported reconstruction"
+    assert warning["fact_type"] == "procedure"
+    assert warning["searched_terms"] == ["rare unsupported reconstruction"]
+    assert result.lines == []
+    assert result.confidence_state == "RED"
+    assert all("_code_" not in key for batch in jev.question_batches for key in batch)
+
+
+def test_high_confidence_none_is_summarized_as_abstention_not_selected_code(
+    session, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "Arthroscopic rotator cuff repair was documented, but coding support is ambiguous."
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {"code": "29827", "description": "Arthroscopic rotator cuff repair"},
+            {"code": "23412", "description": "Open chronic rotator cuff repair"},
+        ],
+    )
+    provider = FakeProvider(fail_on_select=True)
+    jev = ScriptedJevProvider(abstain_for={"rotator cuff repair"})
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    summary = result.jev_output["summary"]
+    assert summary["abstained"] == 1
+    assert summary["codes_selected"] == 0
+    assert summary["accepted"] == 1  # Fact validation only; NONE is not accepted.
+    assert result.lines == []
+    assert any(item["code"] == "JEV_ABSTAINED" for item in result.warnings)
 
 
 def test_jev_primary_planned_not_performed_procedure_is_not_coded(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]

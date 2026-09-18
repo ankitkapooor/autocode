@@ -106,10 +106,14 @@ class ChartProcessor:
                 accepted_ids = set(fact_trace.get("accepted_fact_ids", []))
                 if fact_trace.get("status") == "complete":
                     retrieval_facts = [fact for fact in facts if fact.id in accepted_ids]
-                    retrieval_queries = []
 
             self._stage(chart, "candidate_retrieval")
-            candidates = self._retrieve_candidates(
+            (
+                candidates,
+                fact_candidates,
+                fact_search_terms,
+                legacy_candidates,
+            ) = self._retrieve_candidates(
                 encounter,
                 retrieval_facts,
                 retrieval_queries,
@@ -117,6 +121,7 @@ class ChartProcessor:
                 facts_validated=bool(
                     mode == "jev_primary" and fact_trace and fact_trace.get("status") == "complete"
                 ),
+                prefer_global=mode != "jev_primary",
             )
             self.session.commit()
 
@@ -125,7 +130,8 @@ class ChartProcessor:
                 jev_output, coding_output = self._jev_primary_output(
                     chart,
                     facts,
-                    candidates,
+                    fact_candidates,
+                    fact_search_terms,
                     spans,
                     fact_trace or {},
                     extraction_summary,
@@ -144,7 +150,7 @@ class ChartProcessor:
             else:
                 self._stage(chart, "coding_reasoning")
                 coding_output = self._select_codes(
-                    chart, facts, candidates, provider, extraction_summary
+                    chart, facts, legacy_candidates, provider, extraction_summary
                 )
                 result, lines, pipeline_warnings = self._persist_result(
                     chart, encounter, release, candidates, coding_output
@@ -159,7 +165,8 @@ class ChartProcessor:
                     shadow_output, shadow_coding = self._jev_primary_output(
                         chart,
                         facts,
-                        candidates,
+                        fact_candidates,
+                        fact_search_terms,
                         spans,
                         shadow_fact_trace,
                         extraction_summary,
@@ -411,47 +418,107 @@ class ChartProcessor:
         service_date: Any,
         *,
         facts_validated: bool = False,
-    ) -> list[CandidateCode]:
+        prefer_global: bool = False,
+    ) -> tuple[
+        list[CandidateCode],
+        dict[str, list[CandidateCode]],
+        dict[str, list[str]],
+        list[CandidateCode],
+    ]:
         repository = CodebookRepository(self.session)
-        search_terms = list(queries)
-        search_terms.extend(
-            fact.normalized_value or fact.value
+        codable_facts = [
+            fact
             for fact in facts
             if (facts_validated or fact.assertion == "present")
             and fact.fact_type in {"diagnosis", "procedure", "device", "medication"}
-        )
-        direct_codes = {
-            match.upper()
-            for value in search_terms
-            for match in re.findall(r"\b(?:[A-TV-Z][0-9][0-9A-Z.]{2,6}|\d{4}[FMTU]?|\d{5})\b", value, re.I)
+        ]
+        fact_search_terms = {
+            fact.id: _fact_retrieval_terms(fact, queries, len(codable_facts))
+            for fact in codable_facts
         }
-        found: dict[tuple[str, str], tuple[CodeEntry, str, int]] = {}
-        rank = 0
-        for code in direct_codes:
-            for system in ("CPT", "HCPCS", "ICD10CM"):
-                entry = repository.get_code(system, code, service_date)
-                if entry:
-                    rank += 1
-                    found.setdefault((entry.code_system, entry.code_key), (entry, code, rank))
-        for term in list(dict.fromkeys(search_terms))[:20]:
-            cleaned = " ".join(str(term).split())[:160]
-            if len(cleaned) < 3:
+        entries: dict[tuple[str, str], tuple[CodeEntry, str]] = {}
+        fact_keys: dict[str, list[tuple[str, str]]] = {fact.id: [] for fact in codable_facts}
+        global_keys: list[tuple[str, str]] = []
+
+        def remember(entry: CodeEntry, term: str, *, fact_id: str | None = None) -> None:
+            key = (entry.code_system, entry.code_key)
+            entries.setdefault(key, (entry, term))
+            target = fact_keys[fact_id] if fact_id is not None else global_keys
+            if key not in target:
+                target.append(key)
+
+        for fact in codable_facts:
+            systems = _candidate_systems_for_fact(fact)
+            for term in fact_search_terms[fact.id]:
+                direct_codes = re.findall(
+                    r"\b(?:[A-TV-Z][0-9][0-9A-Z.]{2,6}|\d{4}[FMTU]?|\d{5})\b",
+                    term,
+                    re.I,
+                )
+                for code in direct_codes:
+                    for system in systems:
+                        entry = repository.get_code(system, code, service_date)
+                        if entry is not None:
+                            remember(entry, code.upper(), fact_id=fact.id)
+                if len(term) < 3:
+                    continue
+                for system in systems:
+                    for entry in repository.search_codes(
+                        term, system=system, service_date=service_date, limit=12
+                    ):
+                        remember(entry, term, fact_id=fact.id)
+                        if len(fact_keys[fact.id]) >= 20:
+                            break
+                    if len(fact_keys[fact.id]) >= 20:
+                        break
+                if len(fact_keys[fact.id]) >= 20:
+                    break
+
+        # Preserve the legacy global retrieval surface for rollback/shadow output. These
+        # candidates are persisted, but are never added to another fact's JEV choice.
+        global_terms = list(
+            dict.fromkeys(
+                [*queries, *(fact.normalized_value or fact.value for fact in codable_facts)]
+            )
+        )
+        for raw_term in global_terms[:20]:
+            term = " ".join(str(raw_term).split())[:160]
+            if len(term) < 3:
                 continue
             for system in ("CPT", "ICD10CM", "HCPCS"):
                 for entry in repository.search_codes(
-                    cleaned, system=system, service_date=service_date, limit=4
+                    term, system=system, service_date=service_date, limit=4
                 ):
-                    rank += 1
-                    found.setdefault((entry.code_system, entry.code_key), (entry, cleaned, rank))
-                    if len(found) >= 60:
-                        break
-                if len(found) >= 60:
-                    break
-            if len(found) >= 60:
+                    remember(entry, term)
+
+        # Retain the existing global cap while allocating candidates round-robin so a
+        # noisy first fact cannot exhaust the pool before later facts are represented.
+        selected_keys: list[tuple[str, str]] = []
+        if prefer_global:
+            selected_keys.extend(global_keys[:60])
+        max_fact_candidates = max((len(keys) for keys in fact_keys.values()), default=0)
+        for index in range(max_fact_candidates):
+            if len(selected_keys) >= 60:
                 break
+            for fact in codable_facts:
+                keys = fact_keys[fact.id]
+                if index < len(keys) and keys[index] not in selected_keys:
+                    selected_keys.append(keys[index])
+                    if len(selected_keys) >= 60:
+                        break
+            if len(selected_keys) >= 60:
+                break
+        if len(selected_keys) < 60:
+            for key in global_keys:
+                if key not in selected_keys:
+                    selected_keys.append(key)
+                if len(selected_keys) >= 60:
+                    break
 
         rows: list[CandidateCode] = []
-        for entry, query, retrieval_rank in found.values():
+        row_by_key: dict[tuple[str, str], CandidateCode] = {}
+        for retrieval_rank, key in enumerate(selected_keys, start=1):
+            entry, query = entries[key]
             row = CandidateCode(
                 id=new_id(),
                 encounter_id=encounter.id,
@@ -464,8 +531,14 @@ class ChartProcessor:
             )
             self.session.add(row)
             rows.append(row)
+            row_by_key[key] = row
         self.session.flush()
-        return rows
+        fact_candidates = {
+            fact.id: [row_by_key[key] for key in fact_keys[fact.id] if key in row_by_key]
+            for fact in codable_facts
+        }
+        legacy_candidates = [row_by_key[key] for key in global_keys if key in row_by_key]
+        return rows, fact_candidates, fact_search_terms, legacy_candidates
 
     def _select_codes(
         self,
@@ -650,7 +723,8 @@ class ChartProcessor:
         self,
         chart: Chart,
         facts: list[ClinicalFact],
-        candidates: list[CandidateCode],
+        fact_candidates: dict[str, list[CandidateCode]],
+        fact_search_terms: dict[str, list[str]],
         spans: list[EvidenceSpan],
         fact_trace: dict[str, Any],
         extraction_summary: str,
@@ -680,13 +754,24 @@ class ChartProcessor:
         ]
         questions: dict[str, dict[str, Any]] = {}
         metadata: dict[str, dict[str, Any]] = {}
+        warnings: list[dict[str, Any]] = []
         for fact in codable_facts:
-            systems = (
-                {"ICD10CM"}
-                if fact.fact_type == "diagnosis"
-                else {"CPT", "HCPCS"}
-            )
-            scoped = [item for item in candidates if item.code_system in systems][:20]
+            scoped = fact_candidates.get(fact.id, [])[:20]
+            if not scoped:
+                warnings.append(
+                    {
+                        "code": "NO_CANDIDATES_FOR_FACT",
+                        "message": (
+                            f"No active code candidates were retrieved for {fact.fact_type} "
+                            f"fact '{fact.normalized_value or fact.value}'"
+                        ),
+                        "fact_id": fact.id,
+                        "fact": fact.normalized_value or fact.value,
+                        "fact_type": fact.fact_type,
+                        "searched_terms": fact_search_terms.get(fact.id, []),
+                    }
+                )
+                continue
             criteria: dict[str, str] = {
                 f"candidate_{index}": f"{item.code_system} {item.code}: {item.description or ''}"
                 for index, item in enumerate(scoped)
@@ -711,15 +796,29 @@ class ChartProcessor:
                 },
             }
         selection_state = self._jev_state(chart, validated_facts, spans)
+        selection_state["candidate_groups"] = {
+            fact.id: [
+                self._candidate_state_payload(item)
+                for item in fact_candidates.get(fact.id, [])
+            ]
+            for fact in codable_facts
+            if fact_candidates.get(fact.id)
+        }
         selection_state["candidates"] = [
-            self._candidate_state_payload(item) for item in candidates
+            {"fact_id": fact.id, **self._candidate_state_payload(item)}
+            for fact in codable_facts
+            for item in fact_candidates.get(fact.id, [])
         ]
         selection_output = self._run_jev_decisions(
             chart,
             "jev_code_selection",
             selection_state,
             questions,
-            {"facts": len(codable_facts), "candidates": len(candidates), "questions": len(questions)},
+            {
+                "facts": len(codable_facts),
+                "candidates": sum(len(items) for items in fact_candidates.values()),
+                "questions": len(questions),
+            },
         )
         if selection_output.get("status") != "complete":
             jev_output = _unavailable_jev_graph(
@@ -729,17 +828,20 @@ class ChartProcessor:
                 selection_output.get("label") or "JEV code selection was unavailable",
                 fact_trace.get("decisions", []),
             )
+            jev_output["retrieval_warnings"] = [
+                item for item in warnings if item.get("code") == "NO_CANDIDATES_FOR_FACT"
+            ]
             return jev_output, {
                 "summary": extraction_summary or "Clinical facts and candidates were preserved for review.",
                 "lines": [],
                 "pipeline_warnings": [
-                    {"code": "JEV_UNAVAILABLE", "message": jev_output["label"]}
+                    *warnings,
+                    {"code": "JEV_UNAVAILABLE", "message": jev_output["label"]},
                 ],
             }
 
         selections: list[dict[str, Any]] = []
         proposed: dict[tuple[str, str], dict[str, Any]] = {}
-        warnings: list[dict[str, Any]] = []
         answers = selection_output.get("answers", {})
         for key, details in metadata.items():
             fact = details["fact"]
@@ -819,11 +921,15 @@ class ChartProcessor:
                 fact_trace.get("decisions", []),
             )
             jev_output["code_selections"] = selections
+            jev_output["retrieval_warnings"] = [
+                item for item in warnings if item.get("code") == "NO_CANDIDATES_FOR_FACT"
+            ]
             return jev_output, {
                 "summary": extraction_summary or "JEV modifier decisions require review.",
                 "lines": [],
                 "pipeline_warnings": [
-                    {"code": "JEV_UNAVAILABLE", "message": jev_output["label"]}
+                    *warnings,
+                    {"code": "JEV_UNAVAILABLE", "message": jev_output["label"]},
                 ],
             }
 
@@ -840,11 +946,15 @@ class ChartProcessor:
             )
             jev_output["code_selections"] = selections
             jev_output["modifier_decisions"] = modifier_decisions
+            jev_output["retrieval_warnings"] = [
+                item for item in warnings if item.get("code") == "NO_CANDIDATES_FOR_FACT"
+            ]
             return jev_output, {
                 "summary": extraction_summary or "JEV diagnosis linkage requires review.",
                 "lines": [],
                 "pipeline_warnings": [
-                    {"code": "JEV_UNAVAILABLE", "message": jev_output["label"]}
+                    *warnings,
+                    {"code": "JEV_UNAVAILABLE", "message": jev_output["label"]},
                 ],
             }
 
@@ -916,6 +1026,9 @@ class ChartProcessor:
             "modifier_decisions": modifier_decisions,
             "diagnosis_links": diagnosis_links,
             "rule_exception_decisions": [],
+            "retrieval_warnings": [
+                item for item in warnings if item.get("code") == "NO_CANDIDATES_FOR_FACT"
+            ],
             "summary": summary,
         }
         if any(item.get("abstained") for item in selections):
@@ -1531,7 +1644,11 @@ class ChartProcessor:
         score = min(probabilities) if probabilities else 0.0
         summary = jev_output.get("summary", {})
         unavailable = jev_output.get("status") != "complete"
-        unresolved = bool(summary.get("review", 0) or summary.get("rejected", 0))
+        unresolved = bool(
+            summary.get("review", 0)
+            or summary.get("rejected", 0)
+            or summary.get("abstained", 0)
+        )
         if unavailable or not lines or outcomes["fail"]:
             state = "RED"
         elif (
@@ -1627,6 +1744,65 @@ def _fact_payload(fact: ClinicalFact) -> dict[str, Any]:
     }
 
 
+_RETRIEVAL_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "at",
+    "by",
+    "during",
+    "for",
+    "from",
+    "in",
+    "into",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "was",
+    "were",
+    "with",
+}
+
+
+def _retrieval_tokens(value: str) -> set[str]:
+    aliases = {"arthroscopic": "arthroscopy", "osteoarthritic": "osteoarthritis"}
+    return {
+        aliases.get(token, token)
+        for token in re.findall(r"[a-z0-9]+", value.lower())
+        if len(token) > 1 and token not in _RETRIEVAL_STOPWORDS
+    }
+
+
+def _fact_retrieval_terms(
+    fact: ClinicalFact,
+    queries: list[str],
+    codable_fact_count: int,
+) -> list[str]:
+    values = [fact.normalized_value or "", fact.value]
+    fact_tokens = _retrieval_tokens(" ".join(values))
+    for query in queries:
+        cleaned = " ".join(str(query).split())[:160]
+        if not cleaned:
+            continue
+        if codable_fact_count == 1 or fact_tokens & _retrieval_tokens(cleaned):
+            values.append(cleaned)
+    return [
+        value
+        for value in dict.fromkeys(" ".join(str(item).split())[:160] for item in values)
+        if len(value) >= 3
+    ][:20]
+
+
+def _candidate_systems_for_fact(fact: ClinicalFact) -> tuple[str, ...]:
+    if fact.fact_type == "diagnosis":
+        return ("ICD10CM",)
+    if fact.fact_type in {"medication", "device"}:
+        return ("HCPCS",)
+    return ("CPT", "HCPCS")
+
+
 def _candidate_payload(candidate: CandidateCode) -> dict[str, Any]:
     return {
         "candidate_id": candidate.id,
@@ -1666,12 +1842,24 @@ def _noul_status(probability: float | None, accept_threshold: float) -> tuple[st
 
 
 def _decision_summary(decisions: list[dict[str, Any]]) -> dict[str, int]:
-    summary = {"decision_count": len(decisions), "accepted": 0, "review": 0, "rejected": 0}
+    summary = {
+        "decision_count": len(decisions),
+        "accepted": 0,
+        "review": 0,
+        "rejected": 0,
+        "abstained": 0,
+        "codes_selected": 0,
+    }
     for decision in decisions:
+        if decision.get("abstained"):
+            summary["abstained"] += 1
+            continue
         status = str(decision.get("status", "rejected"))
         if status not in {"accepted", "review", "rejected"}:
             status = "rejected"
         summary[status] += 1
+        if decision.get("selected") and decision.get("code"):
+            summary["codes_selected"] += 1
     return summary
 
 

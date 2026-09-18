@@ -88,3 +88,64 @@ def test_runtime_repositories_are_release_and_date_aware(session: Session) -> No
     assert rules.get_ncci_edit("29826", "29827", date(2026, 9, 1)) is None
     assert rules.get_mue("29827", date(2026, 9, 1), setting="practitioner") is not None
     assert rules.get_mue("29827", date(2026, 9, 1), setting="outpatient_hospital") is None
+
+
+def test_code_search_uses_significant_token_overlap_for_non_exact_clinical_phrase(
+    session: Session,
+) -> None:
+    release = seed_release(session, "2026-Q4", "published", date(2026, 7, 1))
+    source_id = "file-2026-Q4"
+    descriptions = {
+        "29881": (
+            "Arthroscopy knee surgical with meniscectomy medial OR lateral including "
+            "any meniscal shaving"
+        ),
+        "29880": "Arthroscopy knee surgical with meniscectomy medial AND lateral",
+        "29877": "Arthroscopy knee surgical debridement shaving articular cartilage",
+        "29827": "Arthroscopy shoulder surgical rotator cuff repair",
+        "27447": "Total knee arthroplasty",
+    }
+    for index, (code_value, description) in enumerate(descriptions.items(), start=1):
+        entry = CodeEntry(
+            id=f"lexical-code-{index}",
+            codebook_release_id=release.id,
+            code_system="CPT",
+            code=code_value,
+            code_key=code_value,
+            short_description=description,
+            long_description=description,
+            effective_from=date(2026, 7, 1),
+            billable=True,
+            category="Category I",
+            metadata_json={"licensed_boundary": True},
+            source_version="2026",
+            source_file_id=source_id,
+        )
+        session.add(entry)
+        session.flush()
+        session.add(
+            CodeSearchDocument(
+                id=f"lexical-search-{index}",
+                codebook_release_id=release.id,
+                code_entry_id=entry.id,
+                code=entry.code,
+                description=description,
+                synonyms=[],
+                search_text=f"{entry.code} {description}".lower(),
+            )
+        )
+    session.commit()
+
+    repository = CodebookRepository(session)
+    matches = repository.search_codes(
+        "arthroscopic partial medial meniscectomy",
+        system="CPT",
+        service_date=date(2026, 9, 1),
+        limit=5,
+    )
+
+    assert "29881" in [entry.code for entry in matches]
+    assert [entry.code for entry in matches[:2]] == ["29880", "29881"]
+    assert repository.search_codes(
+        "29881", system="CPT", service_date=date(2026, 9, 1), limit=1
+    )[0].code == "29881"

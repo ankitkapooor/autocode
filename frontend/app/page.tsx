@@ -285,11 +285,13 @@ function ReviewView({ chart, coding, pages, facts, queue, busy, onSelect, onSubm
 
 function DecisionEngineSummary({ coding }: { coding: CodingResult }) {
   const summary = coding.jev_summary;
-  return <div className="grid gap-2 rounded-lg border border-line bg-slate-50 p-3 sm:grid-cols-4">
+  const abstained = summary.abstained ?? 0;
+  return <div className="grid gap-2 rounded-lg border border-line bg-slate-50 p-3 sm:grid-cols-5">
     <KeyValue label="Decision engine" value={coding.decision_engine_mode === "jev_primary" ? "TypeSafe JEV" : coding.decision_engine_mode.replaceAll("_", " ")} />
     <KeyValue label="JEV decisions" value={String(summary.decision_count ?? 0)} />
-    <KeyValue label="High confidence" value={String(summary.accepted ?? 0)} />
-    <KeyValue label="Review required" value={String((summary.review ?? 0) + (summary.rejected ?? 0))} />
+    <KeyValue label="Codes selected" value={String(summary.codes_selected ?? 0)} />
+    <KeyValue label="Abstained" value={String(abstained)} />
+    <KeyValue label="Review required" value={String((summary.review ?? 0) + (summary.rejected ?? 0) + abstained)} />
   </div>;
 }
 

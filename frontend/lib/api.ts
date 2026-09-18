@@ -66,6 +66,8 @@ export type CodingSummary = {
     accepted?: number;
     review?: number;
     rejected?: number;
+    abstained?: number;
+    codes_selected?: number;
   };
   jev_decisions: Array<{
     question?: string;
