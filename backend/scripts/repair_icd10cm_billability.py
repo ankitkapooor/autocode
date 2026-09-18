@@ -18,7 +18,7 @@ from app.models.reference import (  # noqa: E402
     RawReferenceFile,
     new_id,
 )
-from app.reference_data.adapters import parse_icd10cm  # noqa: E402
+from app.reference_data.adapters import parse_icd10cm_order_rows  # noqa: E402
 from app.reference_data.pipeline import discover_files  # noqa: E402
 from app.repositories import CodebookRepository  # noqa: E402
 
@@ -45,10 +45,7 @@ def main() -> int:
     ]
     with SessionLocal() as session:
         release = CodebookRepository(session).active_release()
-        parsed = parse_icd10cm(files, release.effective_from)
-        authoritative = {
-            str(row["code_key"]): row for row in parsed.code_entries
-        }
+        authoritative = parse_icd10cm_order_rows(files, release.effective_from)
         existing = {
             entry.code_key: entry
             for entry in session.scalars(
@@ -83,6 +80,25 @@ def main() -> int:
             additions += 1
             if not args.apply:
                 continue
+            parent_key = code_key[:-1]
+            while (
+                len(parent_key) >= 3
+                and parent_key not in existing
+                and parent_key not in authoritative
+            ):
+                parent_key = parent_key[:-1]
+            existing_parent = existing.get(parent_key)
+            authoritative_parent = authoritative.get(parent_key)
+            parent_code = (
+                existing_parent.code
+                if existing_parent is not None
+                else (
+                    str(authoritative_parent["code"])
+                    if authoritative_parent is not None
+                    else None
+                )
+            )
+            chapter = existing_parent.chapter if existing_parent is not None else None
             entry_id = new_id()
             description = row.get("long_description") or row.get("short_description") or ""
             session.add(
@@ -98,8 +114,8 @@ def main() -> int:
                     effective_to=row.get("effective_to"),
                     billable=row.get("billable"),
                     category=row.get("category"),
-                    chapter=row.get("chapter"),
-                    parent_code=row.get("parent_code"),
+                    chapter=chapter,
+                    parent_code=parent_code,
                     anatomic_region=row.get("anatomic_region"),
                     laterality_supported=row.get("laterality_supported"),
                     metadata_json=row.get("metadata_json") or {},

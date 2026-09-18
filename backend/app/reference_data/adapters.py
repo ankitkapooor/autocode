@@ -165,7 +165,7 @@ def _formatted_icd10cm_code(code_key: str) -> str:
     return f"{code_key[:3]}.{code_key[3:]}" if len(code_key) > 3 else code_key
 
 
-def _icd10cm_order_rows(
+def parse_icd10cm_order_rows(
     files: list[DiscoveredFile], effective_from: date
 ) -> dict[str, dict[str, Any]]:
     rows: dict[str, dict[str, Any]] = {}
@@ -285,7 +285,7 @@ def parse_icd10cm(files: list[DiscoveredFile], effective_from: date) -> ParsedBu
                     for parent in chapter.iter()
                 ):
                     visit(item)
-    order_rows = _icd10cm_order_rows(files, effective_from)
+    order_rows = parse_icd10cm_order_rows(files, effective_from)
     entries_by_key = {str(row["code_key"]): row for row in result.code_entries}
     for code_key, order_row in order_rows.items():
         existing = entries_by_key.get(code_key)
