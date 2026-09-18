@@ -28,17 +28,19 @@ The supplied bundle passes structural validation with 11,525 licensed 2026 CPT c
 
 `CODING_DECISION_ENGINE=legacy_llm` preserves the original OpenAI selection followed by JEV verification and is the rollback mode. `jev_shadow` keeps that legacy result user-facing while persisting a separately computed JEV decision graph and agreement metrics. `jev_primary` uses OpenAI only to structure chart evidence; TypeSafe JEV makes the uncertain coding decisions over active retrieved candidates, and Python applies deterministic rules and arithmetic. Primary mode never falls back to OpenAI code selection when JEV is unavailable.
 
-The safe initial configuration is:
+JEV-primary is the default production configuration:
 
 ```bash
-CODING_DECISION_ENGINE=legacy_llm
-JEV_ENABLED=false
+CODING_DECISION_ENGINE=jev_primary
+JEV_ENABLED=true
+JEV_BASE_URL=https://api.typesafe.ai
+JEV_MODEL=jev-latest
 JEV_ACCEPT_THRESHOLD=0.80
 JEV_REVIEW_THRESHOLD=0.50
 AUTONOMOUS_CODING_ENABLED=false
 ```
 
-Operators can move deliberately from `legacy_llm` to `jev_shadow` and then to `jev_primary` after validating the persisted comparison and evaluation metrics.
+`legacy_llm` remains available only as an explicit rollback mode. If JEV is unavailable or a decision does not meet the acceptance threshold, primary mode fails closed and requires human review.
 
 ## Local development
 

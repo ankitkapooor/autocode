@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -322,20 +323,50 @@ class TypeSafeJevProvider:
                 "answers": {},
                 "usage": {},
             }
+        response: httpx.Response | None = None
         try:
-            response = self.client.post(
-                self.endpoint,
-                json={"model": self.model, "state": state, "questions": questions},
-            )
+            for attempt in range(3):
+                response = self.client.post(
+                    self.endpoint,
+                    json={"model": self.model, "state": state, "questions": questions},
+                )
+                if response.status_code not in {429, 529} or attempt == 2:
+                    break
+                retry_after = response.headers.get("retry-after", "")
+                delay = (
+                    float(retry_after)
+                    if retry_after.replace(".", "", 1).isdigit()
+                    else 0.25 * (2**attempt)
+                )
+                time.sleep(min(delay, 2.0))
+            assert response is not None
             response.raise_for_status()
             data = response.json()
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            provider_error = _safe_provider_error(exc.response)
+            return {
+                "provider": self.name,
+                "status": "unavailable",
+                "label": _jev_http_error_label(status_code, provider_error),
+                "model": self.model,
+                "error_code": f"JEV_HTTP_{status_code}",
+                "error_type": type(exc).__name__,
+                "http_status": status_code,
+                "provider_error": provider_error,
+                "retryable": status_code in {429, 529},
+                "question_count": len(questions),
+                "answers": {},
+            }
         except (httpx.HTTPError, ValueError) as exc:
             return {
                 "provider": self.name,
                 "status": "unavailable",
                 "label": "JEV decision service was unavailable; human review is required",
                 "model": self.model,
+                "error_code": "JEV_TRANSPORT_ERROR",
                 "error_type": type(exc).__name__,
+                "question_count": len(questions),
                 "answers": {},
             }
 
@@ -408,6 +439,47 @@ class TypeSafeJevProvider:
             "decisions": decisions,
             "usage": output.get("usage", {}),
         }
+
+
+def _safe_provider_error(response: httpx.Response) -> str | None:
+    """Return provider diagnostics without echoing request state or credentials."""
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    candidates: list[Any] = []
+    if isinstance(error, dict):
+        candidates.extend(error.get(key) for key in ("code", "type"))
+    candidates.extend(payload.get(key) for key in ("code", "type"))
+    parts = [
+        " ".join(str(value).split())[:240]
+        for value in candidates
+        if isinstance(value, (str, int, float)) and str(value).strip()
+    ]
+    return " | ".join(dict.fromkeys(parts)) or None
+
+
+def _jev_http_error_label(status_code: int, provider_error: str | None) -> str:
+    if status_code == 400:
+        summary = "JEV rejected the decision request"
+    elif status_code == 401:
+        summary = "JEV authentication failed"
+    elif status_code == 403:
+        summary = "JEV authorization failed"
+    elif status_code == 422:
+        summary = "JEV could not validate the decision request"
+    elif status_code == 429:
+        summary = "JEV rate limit was exhausted after retries"
+    elif status_code == 529:
+        summary = "JEV remained overloaded after retries"
+    else:
+        summary = "JEV decision service returned an error"
+    detail = f": {provider_error}" if provider_error else ""
+    return f"{summary} (HTTP {status_code}){detail}; human review is required"
 
 
 def _noul_probability(answer: Any) -> float | None:

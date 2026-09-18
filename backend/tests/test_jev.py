@@ -156,6 +156,77 @@ def test_typesafe_jev_failures_return_safe_noncomplete_status(response: httpx.Re
     assert output["status"] in {"unavailable", "malformed"}
 
 
+def test_typesafe_jev_reports_safe_http_diagnostics() -> None:
+    settings = Settings(
+        _env_file=None,
+        jev_enabled=True,
+        jev_api_key="test-key",
+        jev_base_url="https://api.typesafe.ai",
+        jev_model="jev-test",
+    )
+    provider = TypeSafeJevProvider(
+        settings,
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(
+                    400,
+                    json={
+                        "error": {
+                            "code": "invalid_question",
+                            "message": "Question contract was rejected",
+                        }
+                    },
+                )
+            )
+        ),
+    )
+
+    output = provider.decide(
+        {"deidentified": True},
+        {"decision": {"type": "noul", "instructions": "Is it supported?"}},
+    )
+
+    assert output["status"] == "unavailable"
+    assert output["error_code"] == "JEV_HTTP_400"
+    assert output["http_status"] == 400
+    assert output["provider_error"] == "invalid_question"
+    assert output["question_count"] == 1
+
+
+def test_typesafe_jev_retries_transient_provider_overload() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"retry-after": "0"})
+        return httpx.Response(
+            200,
+            json={"answers": {"decision": {"type": "noul", "noul": 0.97}}},
+        )
+
+    settings = Settings(
+        _env_file=None,
+        jev_enabled=True,
+        jev_api_key="test-key",
+        jev_base_url="https://api.typesafe.ai",
+        jev_model="jev-test",
+    )
+    provider = TypeSafeJevProvider(
+        settings,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    output = provider.decide(
+        {"deidentified": True},
+        {"decision": {"type": "noul", "instructions": "Is it supported?"}},
+    )
+
+    assert output["status"] == "complete"
+    assert calls == 2
+
+
 def test_mock_jev_is_explicitly_unavailable_for_primary_decisions() -> None:
     output = MockJevProvider().decide(
         {"deidentified": True},

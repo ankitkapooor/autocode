@@ -149,6 +149,7 @@ class CodebookRepository:
         system: str | None = None,
         service_date: date | None = None,
         limit: int = 20,
+        billable_only: bool = False,
     ) -> list[CodeEntry]:
         service_date = service_date or date.today()
         release = self.active_release(service_date)
@@ -193,6 +194,8 @@ class CodebookRepository:
         )
         if system:
             statement = statement.where(CodeEntry.code_system == system.upper())
+        if billable_only:
+            statement = statement.where(CodeEntry.billable.is_(True))
         rows = self.session.execute(statement).all()
         query_tokens = set(tokens)
         normalized_query_phrase = _normalized_phrase(text_query)

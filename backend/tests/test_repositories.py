@@ -149,3 +149,58 @@ def test_code_search_uses_significant_token_overlap_for_non_exact_clinical_phras
     assert repository.search_codes(
         "29881", system="CPT", service_date=date(2026, 9, 1), limit=1
     )[0].code == "29881"
+
+
+def test_code_search_can_exclude_nonbillable_parent_categories(session: Session) -> None:
+    release = seed_release(session, "2026-billable", "published", date(2026, 7, 1))
+    source_id = "file-2026-billable"
+    for index, (code, description, billable) in enumerate(
+        [
+            ("S83.512", "Sprain of anterior cruciate ligament of left knee", False),
+            (
+                "S83.512A",
+                "Sprain of anterior cruciate ligament of left knee initial encounter",
+                True,
+            ),
+        ],
+        start=1,
+    ):
+        entry = CodeEntry(
+            id=f"billable-code-{index}",
+            codebook_release_id=release.id,
+            code_system="ICD10CM",
+            code=code,
+            code_key=code.replace(".", ""),
+            short_description=description,
+            long_description=description,
+            effective_from=date(2026, 7, 1),
+            billable=billable,
+            category="S83",
+            metadata_json={},
+            source_version="2026",
+            source_file_id=source_id,
+        )
+        session.add(entry)
+        session.flush()
+        session.add(
+            CodeSearchDocument(
+                id=f"billable-search-{index}",
+                codebook_release_id=release.id,
+                code_entry_id=entry.id,
+                code=entry.code,
+                description=description,
+                synonyms=[],
+                search_text=f"{code} {description}".lower(),
+            )
+        )
+    session.commit()
+
+    matches = CodebookRepository(session).search_codes(
+        "left anterior cruciate ligament sprain",
+        system="ICD10CM",
+        service_date=date(2026, 9, 1),
+        limit=10,
+        billable_only=True,
+    )
+
+    assert [entry.code for entry in matches] == ["S83.512A"]

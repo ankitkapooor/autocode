@@ -36,11 +36,11 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     autonomous_coding_enabled: bool = False
 
-    coding_decision_engine: Literal["legacy_llm", "jev_shadow", "jev_primary"] = "legacy_llm"
-    jev_enabled: bool = False
+    coding_decision_engine: Literal["legacy_llm", "jev_shadow", "jev_primary"] = "jev_primary"
+    jev_enabled: bool = True
     jev_api_key: str | None = None
-    jev_base_url: str | None = None
-    jev_model: str | None = None
+    jev_base_url: str | None = "https://api.typesafe.ai"
+    jev_model: str | None = "jev-latest"
     jev_phi_allowed: bool = False
     jev_accept_threshold: float = Field(default=0.80, ge=0.0, le=1.0)
     jev_review_threshold: float = Field(default=0.50, ge=0.0, le=1.0)

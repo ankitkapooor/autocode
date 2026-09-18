@@ -484,13 +484,17 @@ class ChartProcessor:
                 for code in direct_codes:
                     for system in systems:
                         entry = repository.get_code(system, code, service_date)
-                        if entry is not None:
+                        if entry is not None and entry.billable is True:
                             score_hit(entry, code.upper(), 100.0, 0)
                 if len(term) < 3:
                     continue
                 for system in systems:
                     matches = repository.search_codes(
-                        term, system=system, service_date=service_date, limit=20
+                        term,
+                        system=system,
+                        service_date=service_date,
+                        limit=20,
+                        billable_only=True,
                     )
                     for result_rank, entry in enumerate(matches):
                         score_hit(
@@ -531,7 +535,11 @@ class ChartProcessor:
                 continue
             for system in ("CPT", "ICD10CM", "HCPCS"):
                 for entry in repository.search_codes(
-                    term, system=system, service_date=service_date, limit=4
+                    term,
+                    system=system,
+                    service_date=service_date,
+                    limit=4,
+                    billable_only=True,
                 ):
                     remember_global(entry, term)
 
@@ -735,8 +743,7 @@ class ChartProcessor:
             supports_coding = bool(
                 parsed.valid
                 and parsed.value in supported_values
-                and parsed.probability is not None
-                and parsed.probability >= self.settings.jev_review_threshold
+                and bucket == "accepted"
             )
             if supports_coding:
                 accepted_fact_ids.append(fact.id)
@@ -816,42 +823,47 @@ class ChartProcessor:
                     }
                 )
                 continue
-            options = {_candidate_choice_key(item): item for item in scoped}
-            criteria: dict[str, str] = {
-                option: f"{item.code_system} {item.code}: {item.description or ''}"
-                for option, item in options.items()
-            }
-            criteria["NONE"] = "No supplied candidate is supported by the evidence."
-            criteria["INSUFFICIENT_DOCUMENTATION"] = (
-                "The evidence is insufficient to choose among the supplied candidates."
-            )
-            key = decision_key(fact.fact_type, "code", fact.id)
-            questions[key] = {
-                "type": "choice",
-                "instructions": (
-                    f"Choose the single active billing-code candidate best supported for the atomic "
-                    f"{fact.fact_type} fact '{fact.normalized_value or fact.value}'. Abstain when needed."
-                ),
-                "criteria": criteria,
-            }
-            metadata[key] = {
-                "fact": fact,
-                "options": options,
-            }
+            for candidate in scoped:
+                key = decision_key(
+                    fact.fact_type,
+                    "candidate",
+                    fact.id,
+                    candidate.code_system,
+                    canonical_code(candidate.code),
+                )
+                questions[key] = {
+                    "type": "noul",
+                    "instructions": (
+                        f"Does the cited source evidence for the {fact.fact_type} fact "
+                        f"'{fact.normalized_value or fact.value}' directly support separately "
+                        f"reporting active billable {candidate.code_system} {candidate.code} "
+                        f"({candidate.description or 'no description'}) for this encounter?"
+                    ),
+                    "criteria": {
+                        "true": (
+                            "This exact candidate is directly supported, sufficiently specific, "
+                            "billable, and separately reportable for the documented encounter."
+                        ),
+                        "false": (
+                            "The candidate is unsupported, less specific than the documentation, "
+                            "bundled, excluded, historical, planned-only, or uncertain."
+                        ),
+                    },
+                }
+                metadata[key] = {
+                    "fact": fact,
+                    "candidate": candidate,
+                    "candidate_count": len(scoped),
+                }
         selection_state = self._jev_state(chart, validated_facts, spans)
         selection_state["candidate_groups"] = {
             fact.id: [
                 self._candidate_state_payload(item)
-                for item in fact_candidates.get(fact.id, [])
+                for item in fact_candidates.get(fact.id, [])[:20]
             ]
             for fact in codable_facts
             if fact_candidates.get(fact.id)
         }
-        selection_state["candidates"] = [
-            {"fact_id": fact.id, **self._candidate_state_payload(item)}
-            for fact in codable_facts
-            for item in fact_candidates.get(fact.id, [])
-        ]
         selection_output = self._run_jev_decisions(
             chart,
             "jev_code_selection",
@@ -888,49 +900,45 @@ class ChartProcessor:
         answers = selection_output.get("answers", {})
         for key, details in metadata.items():
             fact = details["fact"]
-            options = details["options"]
-            allowed = set(options) | {"NONE", "INSUFFICIENT_DOCUMENTATION"}
-            parsed = parse_choice(answers.get(key), allowed)
-            bucket = decision_bucket(
-                parsed.probability,
-                self.settings.jev_accept_threshold,
-                self.settings.jev_review_threshold,
+            candidate = details["candidate"]
+            parsed = parse_noul(answers.get(key))
+            bucket, supported = _noul_status(
+                parsed.probability, self.settings.jev_accept_threshold
             )
-            candidate = options.get(parsed.value)
-            abstained = parsed.value in {"NONE", "INSUFFICIENT_DOCUMENTATION"}
             selected = bool(
                 parsed.valid
-                and candidate is not None
-                and parsed.probability is not None
-                and parsed.probability >= self.settings.jev_review_threshold
+                and bucket == "accepted"
+                and supported
             )
-            if parsed.error == "out_of_set_choice":
+            if parsed.error:
                 warnings.append(
                     {
-                        "code": "OUT_OF_SET_JEV_CHOICE",
-                        "message": "JEV returned a code choice outside the supplied candidate set",
+                        "code": "MALFORMED_JEV_DECISION",
+                        "message": (
+                            "JEV returned a malformed candidate decision; human review is required"
+                        ),
+                        "question": key,
                     }
                 )
-            alternatives = _choice_alternatives(parsed.probabilities, options)
             decision = {
                 "question": key,
                 "fact_id": fact.id,
                 "fact_type": fact.fact_type,
                 "fact": fact.normalized_value or fact.value,
-                "candidate_id": candidate.id if candidate is not None else None,
-                "code_system": candidate.code_system if candidate is not None else None,
-                "code": candidate.code if candidate is not None else None,
-                "choice": parsed.value,
+                "candidate_id": candidate.id,
+                "code_system": candidate.code_system,
+                "code": candidate.code,
+                "description": candidate.description,
                 "probability": parsed.probability,
                 "status": bucket,
+                "supported": supported,
                 "selected": selected,
-                "abstained": abstained,
+                "abstained": not parsed.valid,
                 "error": parsed.error,
-                "alternatives": alternatives,
                 "evidence_span_ids": fact.evidence_span_ids,
             }
             selections.append(decision)
-            if not selected or candidate is None:
+            if not selected:
                 continue
             code_key = (candidate.code_system, canonical_code(candidate.code))
             existing = proposed.get(code_key)
@@ -940,8 +948,7 @@ class ChartProcessor:
                     "facts": [fact],
                     "probability": parsed.probability,
                     "evidence_span_ids": list(fact.evidence_span_ids),
-                    "alternatives": alternatives,
-                    "candidate_count": len(options),
+                    "candidate_count": details["candidate_count"],
                 }
             else:
                 existing["facts"].append(fact)
@@ -949,9 +956,30 @@ class ChartProcessor:
                 existing["evidence_span_ids"] = sorted(
                     set(existing["evidence_span_ids"]) | set(fact.evidence_span_ids)
                 )
-                existing["candidate_count"] = max(existing["candidate_count"], len(options))
+                existing["candidate_count"] = max(
+                    existing["candidate_count"], details["candidate_count"]
+                )
 
         proposed_lines = list(proposed.values())
+        if any(item.get("status") == "review" for item in selections):
+            warnings.append(
+                {
+                    "code": "JEV_REVIEW_REQUIRED",
+                    "message": (
+                        "One or more candidate decisions remained in the review band and were "
+                        "not coded"
+                    ),
+                }
+            )
+        if codable_facts and not proposed_lines:
+            warnings.append(
+                {
+                    "code": "JEV_NO_SUPPORTED_CODE",
+                    "message": (
+                        "JEV did not accept any active billable candidate; human review is required"
+                    ),
+                }
+            )
         modifier_output, modifier_decisions = self._jev_modifier_decisions(
             chart, validated_facts, spans, proposed_lines
         )
@@ -1058,6 +1086,7 @@ class ChartProcessor:
             + diagnosis_links
         )
         summary = _decision_summary(all_decisions)
+        summary["codes_selected"] = len(line_output)
         model = selection_output.get("model") or fact_trace.get("model")
         jev_output = {
             "provider": self.jev_provider.name,
@@ -1098,19 +1127,19 @@ class ChartProcessor:
         proposed_lines: list[dict[str, Any]],
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         supported_text = " ".join(
-            (fact.normalized_value or fact.value).lower() for fact in facts
+            f"{fact.value} {fact.normalized_value or ''}".lower() for fact in facts
         )
         left = bool(re.search(r"\b(left|lt)\b", supported_text))
         right = bool(re.search(r"\b(right|rt)\b", supported_text))
-        bilateral = "bilateral" in supported_text or (left and right)
         modifier_codes: list[str] = []
-        if bilateral:
+        if "bilateral" in supported_text:
             modifier_codes.append("50")
-        elif left:
-            modifier_codes.append("LT")
-        elif right:
-            modifier_codes.append("RT")
-        if len([row for row in proposed_lines if row["candidate"].code_system in {"CPT", "HCPCS"}]) > 1:
+        else:
+            if left:
+                modifier_codes.append("LT")
+            if right:
+                modifier_codes.append("RT")
+        if "modifier 51" in supported_text or "multiple procedure modifier" in supported_text:
             modifier_codes.append("51")
         if "assistant surgeon" in supported_text or "assistant at surgery" in supported_text:
             modifier_codes.append("80")
@@ -1881,10 +1910,6 @@ def _candidate_systems_for_fact(fact: ClinicalFact) -> tuple[str, ...]:
     return ("CPT", "HCPCS")
 
 
-def _candidate_choice_key(candidate: CandidateCode) -> str:
-    return decision_key("candidate", candidate.code_system, canonical_code(candidate.code))
-
-
 def _candidate_payload(candidate: CandidateCode) -> dict[str, Any]:
     return {
         "candidate_id": candidate.id,
@@ -1893,25 +1918,6 @@ def _candidate_payload(candidate: CandidateCode) -> dict[str, Any]:
         "description": candidate.description,
         "retrieval_rank": candidate.retrieval_rank,
     }
-
-
-def _choice_alternatives(
-    probabilities: dict[str, float],
-    options: dict[str, CandidateCode],
-) -> list[dict[str, Any]]:
-    alternatives = [
-        {
-            "candidate_id": candidate.id,
-            "code_system": candidate.code_system,
-            "code": candidate.code,
-            "description": candidate.description,
-            "probability": probability,
-        }
-        for option, probability in probabilities.items()
-        if (candidate := options.get(option)) is not None
-    ]
-    return sorted(alternatives, key=lambda item: item["probability"], reverse=True)
-
 
 def _noul_status(probability: float | None, accept_threshold: float) -> tuple[str, bool]:
     if probability is None:

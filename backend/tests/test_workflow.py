@@ -192,7 +192,22 @@ class ScriptedJevProvider:
             else:
                 instructions = question["instructions"].lower()
                 probability = 0.95
-                if "modifier rt" in instructions and "right" not in evidence:
+                if "_candidate_" in key:
+                    target = next(
+                        (
+                            code
+                            for phrase, code in self.code_by_fact.items()
+                            if phrase.lower() in instructions
+                        ),
+                        None,
+                    )
+                    if any(phrase.lower() in instructions for phrase in self.abstain_for):
+                        probability = 0.5
+                    elif target and f" {target.lower()} (" in instructions:
+                        probability = 0.96
+                    else:
+                        probability = 0.05
+                elif "modifier rt" in instructions and "right" not in evidence:
                     probability = 0.05
                 elif "modifier lt" in instructions and "left" not in evidence:
                     probability = 0.05
@@ -292,7 +307,7 @@ def _seed_chart(
             short_description=row["description"],
             long_description=row["description"],
             effective_from=date(2026, 1, 1),
-            billable=True,
+            billable=row.get("billable", True),
             category="Category I",
             chapter="Test",
             metadata_json=row.get("metadata", {"licensed_boundary": True}),
@@ -356,6 +371,7 @@ def test_chart_processing_preserves_evidence_and_applies_gate(session, tmp_path:
         local_storage_path=tmp_path,
         openai_api_key="test",
         llm_model="test",
+        coding_decision_engine="legacy_llm",
         autonomous_coding_enabled=False,
     )
     run = ReferenceImportRun(
@@ -493,6 +509,54 @@ def test_jev_primary_calls_extraction_but_never_openai_code_selection(session, t
     assert result.jev_output["mode"] == "primary"
 
 
+def test_jev_primary_can_select_multiple_supported_codes_for_one_fact(
+    session, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "Two separately reportable shoulder services were performed in the same encounter."
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {"code": "29827", "description": "primary tendon repair service"},
+            {"code": "29826", "description": "separate decompression service"},
+        ],
+    )
+    provider = FakeProvider(
+        facts=[
+            {
+                "fact_type": "procedure",
+                "value": "combined separately reportable shoulder services",
+                "normalized_value": "combined shoulder services",
+                "assertion": "present",
+                "confidence": 0.99,
+            }
+        ],
+        search_queries=["primary tendon repair service", "separate decompression service"],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(
+        code_by_fact={
+            "primary tendon repair service": "29827",
+            "separate decompression service": "29826",
+        }
+    )
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert {line.code for line in result.lines} == {"29827", "29826"}
+    assert result.jev_output["summary"]["codes_selected"] == 2
+
+
 def test_jev_primary_retrieves_total_hip_and_diagnosis_from_independent_fact_pools(
     session, tmp_path: Path
 ) -> None:  # type: ignore[no-untyped-def]
@@ -563,22 +627,24 @@ def test_jev_primary_retrieves_total_hip_and_diagnosis_from_independent_fact_poo
     assert result is not None
     assert provider.select_calls == 0
     assert {line.code for line in result.lines} == {"27130", "M16.12"}
-    code_questions = {
-        question["instructions"]: set(question["criteria"].values())
+    code_questions = [
+        question["instructions"]
         for batch in jev.question_batches
         for key, question in batch.items()
-        if "_code_" in key
-    }
-    procedure_options = next(
-        options for instructions, options in code_questions.items() if "total hip arthroplasty" in instructions
-    )
-    diagnosis_options = next(
-        options for instructions, options in code_questions.items() if "osteoarthritis" in instructions
-    )
-    assert any("CPT 27130:" in option for option in procedure_options)
-    assert all(not option.startswith("ICD10CM") for option in procedure_options)
-    assert any("ICD10CM M16.12:" in option for option in diagnosis_options)
-    assert all(not option.startswith("CPT") for option in diagnosis_options)
+        if "_candidate_" in key
+    ]
+    procedure_questions = [
+        instructions
+        for instructions in code_questions
+        if "total hip arthroplasty" in instructions
+    ]
+    diagnosis_questions = [
+        instructions for instructions in code_questions if "osteoarthritis" in instructions
+    ]
+    assert any("CPT 27130 (" in instructions for instructions in procedure_questions)
+    assert all("ICD10CM" not in instructions for instructions in procedure_questions)
+    assert any("ICD10CM M16.12 (" in instructions for instructions in diagnosis_questions)
+    assert all("CPT " not in instructions for instructions in diagnosis_questions)
 
 
 def test_jev_primary_uses_evidence_linked_diagnosis_to_retrieve_trigger_release_cpt(
@@ -668,13 +734,13 @@ def test_jev_primary_uses_evidence_linked_diagnosis_to_retrieve_trigger_release_
         question
         for batch in jev.question_batches
         for key, question in batch.items()
-        if "procedure_code_" in key
+        if "procedure_candidate_" in key and "CPT 26055 (" in question["instructions"]
     )
-    assert "candidate_cpt_26055" in procedure_question["criteria"]
+    assert "A1 pulley release" in procedure_question["instructions"]
     procedure_decision = next(
         item
         for item in result.jev_output["code_selections"]
-        if item["fact_type"] == "procedure"
+        if item["fact_type"] == "procedure" and item["selected"]
     )
     assert procedure_decision["code"] == "26055"
     assert procedure_decision["abstained"] is False
@@ -753,9 +819,8 @@ def test_jev_primary_code_choices_use_only_the_generating_facts_candidate_pool(
         question
         for batch in jev.question_batches
         for key, question in batch.items()
-        if "_code_" in key
+        if "_candidate_" in key
     ]
-    assert len(code_questions) == 4
     expected = {
         "rotator cuff repair": "29827",
         "acromioplasty": "29826",
@@ -763,18 +828,18 @@ def test_jev_primary_code_choices_use_only_the_generating_facts_candidate_pool(
         "right shoulder impingement": "M75.41",
     }
     for phrase, code in expected.items():
-        question = next(item for item in code_questions if phrase in item["instructions"])
-        candidate_options = [
-            value
-            for key, value in question["criteria"].items()
-            if key.startswith("candidate_")
+        fact_questions = [
+            item for item in code_questions if phrase in item["instructions"]
         ]
-        assert candidate_options
-        assert any(f" {code}:" in option for option in candidate_options)
+        assert fact_questions
+        assert any(f" {code} (" in item["instructions"] for item in fact_questions)
         if code.startswith("M"):
-            assert all(option.startswith("ICD10CM") for option in candidate_options)
+            assert all("ICD10CM " in item["instructions"] for item in fact_questions)
         else:
-            assert all(option.startswith(("CPT", "HCPCS")) for option in candidate_options)
+            assert all(
+                "CPT " in item["instructions"] or "HCPCS " in item["instructions"]
+                for item in fact_questions
+            )
 
 
 def test_jev_primary_records_zero_candidate_fact_without_empty_choice(
@@ -814,10 +879,10 @@ def test_jev_primary_records_zero_candidate_fact_without_empty_choice(
     assert warning["searched_terms"] == ["rare unsupported reconstruction"]
     assert result.lines == []
     assert result.confidence_state == "RED"
-    assert all("_code_" not in key for batch in jev.question_batches for key in batch)
+    assert all("_candidate_" not in key for batch in jev.question_batches for key in batch)
 
 
-def test_high_confidence_none_is_summarized_as_abstention_not_selected_code(
+def test_ambiguous_candidate_decisions_require_review_without_selecting_code(
     session, tmp_path: Path
 ) -> None:  # type: ignore[no-untyped-def]
     settings = _settings(tmp_path, "jev_primary")
@@ -845,11 +910,12 @@ def test_high_confidence_none_is_summarized_as_abstention_not_selected_code(
     result = session.get(CodingResult, report["result_id"])
     assert result is not None
     summary = result.jev_output["summary"]
-    assert summary["abstained"] == 1
+    assert summary["abstained"] == 0
     assert summary["codes_selected"] == 0
-    assert summary["accepted"] == 1  # Fact validation only; NONE is not accepted.
+    assert summary["accepted"] == 1  # Fact validation only.
+    assert summary["review"] == 2
     assert result.lines == []
-    assert any(item["code"] == "JEV_ABSTAINED" for item in result.warnings)
+    assert any(item["code"] == "JEV_REVIEW_REQUIRED" for item in result.warnings)
 
 
 def test_jev_primary_planned_not_performed_procedure_is_not_coded(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
