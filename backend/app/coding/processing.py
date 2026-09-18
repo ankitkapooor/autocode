@@ -856,15 +856,7 @@ class ChartProcessor:
                     "candidate_count": len(scoped),
                 }
         selection_state = self._jev_state(chart, validated_facts, spans)
-        selection_state["candidate_groups"] = {
-            fact.id: [
-                self._candidate_state_payload(item)
-                for item in fact_candidates.get(fact.id, [])[:20]
-            ]
-            for fact in codable_facts
-            if fact_candidates.get(fact.id)
-        }
-        selection_output = self._run_jev_decisions(
+        selection_output = self._run_jev_decision_batches(
             chart,
             "jev_code_selection",
             selection_state,
@@ -1328,28 +1320,6 @@ class ChartProcessor:
             "evidence": evidence,
         }
 
-    def _candidate_state_payload(self, candidate: CandidateCode) -> dict[str, Any]:
-        entry = self.session.get(CodeEntry, candidate.code_entry_id)
-        metadata = entry.metadata_json if entry is not None else {}
-        return {
-            **_candidate_payload(candidate),
-            "codebook_metadata": {
-                "billable": entry.billable if entry is not None else None,
-                "category": entry.category if entry is not None else None,
-                "chapter": entry.chapter if entry is not None else None,
-                "anatomic_region": entry.anatomic_region if entry is not None else None,
-                "laterality_supported": (
-                    entry.laterality_supported if entry is not None else None
-                ),
-                "billing_unit_mg": (
-                    metadata.get("billing_unit_mg") if isinstance(metadata, dict) else None
-                ),
-                "unit_size_mg": (
-                    metadata.get("unit_size_mg") if isinstance(metadata, dict) else None
-                ),
-            },
-        }
-
     def _run_jev_decisions(
         self,
         chart: Chart,
@@ -1403,6 +1373,55 @@ class ChartProcessor:
         run.completed_at = utcnow()
         self.session.commit()
         return output
+
+    def _run_jev_decision_batches(
+        self,
+        chart: Chart,
+        stage: str,
+        state: dict[str, Any],
+        questions: dict[str, dict[str, Any]],
+        input_summary: dict[str, Any],
+        *,
+        batch_size: int = 40,
+    ) -> dict[str, Any]:
+        if len(questions) <= batch_size:
+            return self._run_jev_decisions(
+                chart, stage, state, questions, input_summary
+            )
+        question_items = list(questions.items())
+        batch_count = math.ceil(len(question_items) / batch_size)
+        combined_answers: dict[str, Any] = {}
+        combined_usage: dict[str, float] = {}
+        last_output: dict[str, Any] = {}
+        for batch_index in range(batch_count):
+            start = batch_index * batch_size
+            batch_questions = dict(question_items[start : start + batch_size])
+            last_output = self._run_jev_decisions(
+                chart,
+                stage,
+                state,
+                batch_questions,
+                {
+                    **input_summary,
+                    "batch": batch_index + 1,
+                    "batch_count": batch_count,
+                    "batch_questions": len(batch_questions),
+                },
+            )
+            if last_output.get("status") != "complete":
+                return last_output
+            combined_answers.update(last_output.get("answers", {}))
+            for key, value in last_output.get("usage", {}).items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    combined_usage[key] = combined_usage.get(key, 0) + float(value)
+        return {
+            **last_output,
+            "status": "complete",
+            "label": "JEV returned typed decisions across bounded batches",
+            "answers": combined_answers,
+            "usage": combined_usage,
+            "batch_count": batch_count,
+        }
 
     def _run_provider(
         self,
@@ -1909,15 +1928,6 @@ def _candidate_systems_for_fact(fact: ClinicalFact) -> tuple[str, ...]:
         return ("HCPCS",)
     return ("CPT", "HCPCS")
 
-
-def _candidate_payload(candidate: CandidateCode) -> dict[str, Any]:
-    return {
-        "candidate_id": candidate.id,
-        "code_system": candidate.code_system,
-        "code": candidate.code,
-        "description": candidate.description,
-        "retrieval_rank": candidate.retrieval_rank,
-    }
 
 def _noul_status(probability: float | None, accept_threshold: float) -> tuple[str, bool]:
     if probability is None:

@@ -557,6 +557,40 @@ def test_jev_primary_can_select_multiple_supported_codes_for_one_fact(
     assert result.jev_output["summary"]["codes_selected"] == 2
 
 
+def test_jev_candidate_decisions_are_sent_in_bounded_batches(
+    session, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text="Synthetic batching fixture with enough embedded text for processing.",
+        codes=[{"code": "29827", "description": "rotator cuff repair"}],
+    )
+    jev = ScriptedJevProvider()
+    processor = ChartProcessor(session, settings, jev_provider=jev)
+    questions = {
+        f"candidate_{index}": {
+            "type": "noul",
+            "instructions": f"Is synthetic candidate {index} supported?",
+            "criteria": {"true": "Supported", "false": "Unsupported"},
+        }
+        for index in range(81)
+    }
+
+    output = processor._run_jev_decision_batches(
+        chart,
+        "jev_code_selection",
+        {"deidentified": True},
+        questions,
+        {"questions": len(questions)},
+    )
+
+    assert output["status"] == "complete"
+    assert len(output["answers"]) == 81
+    assert [len(batch) for batch in jev.question_batches] == [40, 40, 1]
+
+
 def test_jev_primary_retrieves_total_hip_and_diagnosis_from_independent_fact_pools(
     session, tmp_path: Path
 ) -> None:  # type: ignore[no-untyped-def]
