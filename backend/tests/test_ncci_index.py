@@ -21,7 +21,8 @@ def test_compact_ncci_source_index_supports_directional_effective_date_lookup(
     )
     source_path.parent.mkdir(parents=True)
     source_path.write_text(
-        "Column 1\tColumn 2\t*=in existence prior to 1996\tEffective Date\tDeletion Date\tModifier\tPTP Edit Rationale\n"
+        "Column 1\tColumn 2\t*=in existence prior to 1996\tEffective Date\t"
+        "Deletion Date\tModifier\tPTP Edit Rationale\n"
         "29827\t29826\t\t20200101\t20241231\t0\tHistorical edit\n"
         "29827\t29826\t\t20250101\t*\t1\tDistinct service allowed\n"
         "29827\t73030\t*\t\t*\t0\tPrior edit\n"
@@ -47,7 +48,9 @@ def test_compact_ncci_source_index_supports_directional_effective_date_lookup(
     index = NcciSourceIndex(index_path, source_root)
 
     assert report["record_count"] == 4
-    assert report["file_size"] < source_path.stat().st_size * 4
+    assert report["format"] == "sqlite"
+    assert report["settings"] == ["practitioner"]
+    assert report["file_size"] < 100_000
     assert index.is_compatible("manifest-1")
     current = index.lookup("practitioner", "29827", "29826", date(2026, 9, 1))
     assert current is not None

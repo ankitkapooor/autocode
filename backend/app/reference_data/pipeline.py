@@ -114,32 +114,42 @@ def discover_files(source_root: Path) -> list[DiscoveredFile]:
     return discovered
 
 
-def _parse(files: list[DiscoveredFile], effective_from: date) -> ParsedBundle:
+def _parse(
+    files: list[DiscoveredFile], effective_from: date, *, include_ncci: bool = True
+) -> ParsedBundle:
     by_family: dict[str, list[DiscoveredFile]] = {}
     for item in files:
         by_family.setdefault(item.source_family, []).append(item)
     parsed = ParsedBundle()
-    for family, parser in (
+    parsers = [
         ("icd10cm", adapters.parse_icd10cm),
         ("icd10pcs", adapters.parse_icd10pcs),
         ("hcpcs", adapters.parse_hcpcs),
         ("cpt_licensed", adapters.parse_cpt),
         ("pfs", adapters.parse_pfs),
-        ("ncci", adapters.parse_ncci_ptp),
         ("mue", adapters.parse_mue),
         ("ncci", adapters.parse_addon),
         ("rules", adapters.parse_rule_documents),
-    ):
+    ]
+    if include_ncci:
+        parsers.insert(5, ("ncci", adapters.parse_ncci_ptp))
+    for family, parser in parsers:
         parsed.extend(parser(by_family.get(family, []), effective_from))
     return parsed
 
 
-def _report(files: list[DiscoveredFile], parsed: ParsedBundle, fingerprint: str) -> dict[str, Any]:
+def _report(
+    files: list[DiscoveredFile],
+    parsed: ParsedBundle,
+    fingerprint: str,
+    *,
+    ncci_count: int | None = None,
+) -> dict[str, Any]:
     counts = {
         "code_entries": len(parsed.code_entries),
         "modifiers": len(parsed.modifiers),
         "pfs_attributes": len(parsed.pfs_attributes),
-        "ncci_ptp_edits": len(parsed.ncci_edits),
+        "ncci_ptp_edits": len(parsed.ncci_edits) if ncci_count is None else ncci_count,
         "mue_edits": len(parsed.mue_edits),
         "addon_relations": len(parsed.addon_relations),
         "rule_documents": len(parsed.rule_documents),
@@ -168,9 +178,30 @@ def import_reference_bundle(
 ) -> dict[str, Any]:
     files = discover_files(source_root)
     fingerprint = manifest_sha256((item.relative_path, item.sha256) for item in files)
-    parsed = _parse(files, effective_from)
-    validate_bundle(parsed)
-    report = _report(files, parsed, fingerprint)
+    if not materialize_ncci and ncci_index_path is None:
+        raise ValueError("ncci_index_path is required when materialize_ncci=False")
+
+    parsed = _parse(files, effective_from, include_ncci=materialize_ncci)
+    ncci_report: dict[str, Any] | None = None
+    ncci_settings: set[str] | None = None
+    if not materialize_ncci:
+        assert ncci_index_path is not None
+        ncci_report = build_ncci_source_index(
+            [item for item in files if item.source_family == "ncci"],
+            source_root,
+            ncci_index_path,
+            source_manifest_sha256=fingerprint,
+        )
+        ncci_settings = set(ncci_report["settings"])
+    validate_bundle(parsed, ncci_settings=ncci_settings)
+    report = _report(
+        files,
+        parsed,
+        fingerprint,
+        ncci_count=ncci_report["record_count"] if ncci_report is not None else None,
+    )
+    if ncci_report is not None:
+        report["ncci_source_index"] = ncci_report
     if dry_run:
         return report
     if session is None:
@@ -236,15 +267,6 @@ def import_reference_bundle(
                 context=issue.context,
             )
         )
-    if not materialize_ncci and ncci_index_path is not None:
-        ncci_report = build_ncci_source_index(
-            [item for item in files if item.source_family == "ncci"],
-            source_root,
-            ncci_index_path,
-            source_manifest_sha256=fingerprint,
-        )
-        report["ncci_source_index"] = ncci_report
-        release.validation_summary = report
     run.status = release.status
     run.completed_at = utcnow()
     run.summary = report

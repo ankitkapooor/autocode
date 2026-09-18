@@ -480,8 +480,8 @@ def _ncci_setting(path: str) -> str:
     return "unknown"
 
 
-def parse_ncci_ptp(files: list[DiscoveredFile], effective_from: date) -> ParsedBundle:
-    result = ParsedBundle()
+def iter_ncci_ptp(files: list[DiscoveredFile], effective_from: date) -> Iterator[dict[str, Any]]:
+    """Yield NCCI rows without retaining the multi-million-row corpus in memory."""
     for source, name, payload in _payloads(files, {".txt", ".csv", ".xlsx"}):
         if "ptp" not in name.lower() and not any(
             token in name.lower() for token in ("ccipra", "ccioph")
@@ -498,21 +498,24 @@ def parse_ncci_ptp(files: list[DiscoveredFile], effective_from: date) -> ParsedB
             if start is None and prior == "*":
                 start = date.min
             deletion = parse_date(_first(row, "deletion_date", "deletion"))
-            result.ncci_edits.append(
-                {
-                    "setting": setting,
-                    "column_1_code": first,
-                    "column_1_code_key": canonical_code(first),
-                    "column_2_code": second,
-                    "column_2_code_key": canonical_code(second),
-                    "effective_from": start or effective_from,
-                    "effective_to": deletion,
-                    "deletion_date": deletion,
-                    "modifier_indicator": _first(row, "modifier", "modifier_indicator") or None,
-                    "source_file_id": source.id,
-                    "source_record": row,
-                }
-            )
+            yield {
+                "setting": setting,
+                "column_1_code": first,
+                "column_1_code_key": canonical_code(first),
+                "column_2_code": second,
+                "column_2_code_key": canonical_code(second),
+                "effective_from": start or effective_from,
+                "effective_to": deletion,
+                "deletion_date": deletion,
+                "modifier_indicator": _first(row, "modifier", "modifier_indicator") or None,
+                "source_file_id": source.id,
+                "source_record": row,
+            }
+
+
+def parse_ncci_ptp(files: list[DiscoveredFile], effective_from: date) -> ParsedBundle:
+    result = ParsedBundle()
+    result.ncci_edits.extend(iter_ncci_ptp(files, effective_from))
     return result
 
 

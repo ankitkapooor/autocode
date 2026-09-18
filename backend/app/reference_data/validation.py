@@ -6,7 +6,9 @@ from app.reference_data.types import ParsedBundle, ValidationIssue
 from app.reference_data.utils import canonical_code
 
 
-def validate_bundle(bundle: ParsedBundle) -> list[ValidationIssue]:
+def validate_bundle(
+    bundle: ParsedBundle, *, ncci_settings: set[str] | None = None
+) -> list[ValidationIssue]:
     """Validate and deterministically de-duplicate a parsed release."""
     issues: list[ValidationIssue] = []
 
@@ -56,7 +58,8 @@ def validate_bundle(bundle: ParsedBundle) -> list[ValidationIssue]:
             )
         )
 
-    ncci_settings = {str(row.get("setting")) for row in bundle.ncci_edits}
+    if ncci_settings is None:
+        ncci_settings = {str(row.get("setting")) for row in bundle.ncci_edits}
     for setting in ("practitioner", "outpatient_hospital"):
         if setting not in ncci_settings:
             issues.append(

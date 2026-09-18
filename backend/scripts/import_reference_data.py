@@ -3,19 +3,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.database import Base, SessionLocal, engine  # noqa: E402
 from app.config import get_settings  # noqa: E402
+from app.database import Base, SessionLocal, engine  # noqa: E402
 from app.reference_data.pipeline import import_reference_bundle  # noqa: E402
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Normalize a complete OrthoCode reference-data bundle")
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    parser = argparse.ArgumentParser(
+        description="Normalize a complete OrthoCode reference-data bundle"
+    )
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--release-name", default="2026-Q3")
     parser.add_argument("--effective-from", type=date.fromisoformat, default=date(2026, 7, 1))
