@@ -32,6 +32,12 @@ class ClinicalReasoningProvider(Protocol):
 class JevProvider(Protocol):
     name: str
 
+    def decide(
+        self,
+        state: dict[str, Any],
+        questions: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]: ...
+
     def validate(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
@@ -77,6 +83,8 @@ class OpenAIClinicalProvider:
                                     "approach",
                                     "encounter",
                                     "clinical_context",
+                                    "medication",
+                                    "quantity",
                                 ],
                             },
                             "value": {"type": "string"},
@@ -112,8 +120,11 @@ class OpenAIClinicalProvider:
             name="orthocode_clinical_facts",
             schema=schema,
             instructions=(
-                "You extract de-identified orthopedic coding facts. Use only the supplied evidence. "
-                "Never infer an undocumented diagnosis, procedure, laterality, approach, device, or quantity. "
+                "You extract atomic, de-identified orthopedic clinical facts. Use only the supplied "
+                "evidence. Split compound procedures into one fact per independently codable clinical "
+                "concept. Distinguish performed, planned, historical, absent, and uncertain statements "
+                "through the assertion field. Never infer an undocumented diagnosis, procedure, "
+                "laterality, approach, device, medication, or quantity. "
                 "Every fact must cite one or more exact evidence_span_ids. Produce concise retrieval queries "
                 "for CPT and ICD-10-CM candidate search; do not assign codes in this stage."
             ),
@@ -210,14 +221,59 @@ class OpenAIClinicalProvider:
 
 class MockJevProvider:
     name = "mock"
+    model = "mock"
+
+    def decide(
+        self,
+        state: dict[str, Any],
+        questions: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "provider": self.name,
+            "status": "unavailable",
+            "label": "JEV is disabled or not configured; human review is required",
+            "model": self.model,
+            "answers": {},
+            "question_count": len(questions),
+        }
 
     def validate(self, payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "provider": self.name,
             "status": "not_executed",
-            "label": "Mock adapter — no external Jev decision was used",
+            "label": "Mock adapter — no external JEV decision was used",
             "line_count": len(payload.get("lines", [])),
             "agreements": [],
+        }
+
+
+class UnavailableJevProvider(MockJevProvider):
+    name = "typesafe_jev"
+
+    def __init__(self, settings: Settings):
+        self.model = settings.jev_model or "unconfigured"
+
+    def decide(
+        self,
+        state: dict[str, Any],
+        questions: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "provider": self.name,
+            "status": "unavailable",
+            "label": "JEV is enabled but its provider configuration is incomplete",
+            "model": self.model,
+            "answers": {},
+            "question_count": len(questions),
+        }
+
+    def validate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "provider": self.name,
+            "status": "unavailable",
+            "label": "JEV is enabled but its provider configuration is incomplete",
+            "model": self.model,
+            "answers": {},
         }
 
 
@@ -239,32 +295,33 @@ class TypeSafeJevProvider:
         )
         self.model = settings.jev_model
         self.phi_allowed = settings.jev_phi_allowed
+        self.accept_threshold = settings.jev_accept_threshold
         self.client = client or httpx.Client(
             headers={"Authorization": f"Bearer {settings.jev_api_key}"}, timeout=30.0
         )
 
-    def validate(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if not payload.get("deidentified") and not self.phi_allowed:
+    def decide(
+        self,
+        state: dict[str, Any],
+        questions: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not state.get("deidentified") and not self.phi_allowed:
             return {
                 "provider": self.name,
                 "status": "blocked_phi",
-                "label": "Jev blocked because the chart is not approved for this provider",
+                "label": "JEV blocked because the chart is not approved for this provider",
+                "model": self.model,
                 "answers": {},
             }
-        questions, metadata = _jev_questions(payload.get("lines", []))
         if not questions:
             return {
                 "provider": self.name,
-                "status": "not_applicable",
-                "label": "No proposed coding lines required a Jev decision",
+                "status": "complete",
+                "label": "No JEV questions were required",
+                "model": self.model,
                 "answers": {},
+                "usage": {},
             }
-        state = {
-            "service_date": payload.get("service_date"),
-            "setting": payload.get("setting"),
-            "clinical_facts": payload.get("clinical_facts", []),
-            "proposed_coding_lines": payload.get("lines", []),
-        }
         try:
             response = self.client.post(
                 self.endpoint,
@@ -276,32 +333,121 @@ class TypeSafeJevProvider:
             return {
                 "provider": self.name,
                 "status": "unavailable",
-                "label": "Jev decision service was unavailable; human review is required",
+                "label": "JEV decision service was unavailable; human review is required",
+                "model": self.model,
                 "error_type": type(exc).__name__,
                 "answers": {},
             }
 
         answers = data.get("answers", {})
+        if not isinstance(answers, dict):
+            return {
+                "provider": self.name,
+                "status": "malformed",
+                "label": "JEV returned a malformed answer set; human review is required",
+                "model": data.get("model", self.model),
+                "answers": {},
+                "usage": data.get("usage", {}),
+            }
+        malformed = [
+            key
+            for key, question in questions.items()
+            if not _typed_answer_valid(question.get("type"), answers.get(key))
+        ]
+        if malformed:
+            return {
+                "provider": self.name,
+                "status": "malformed",
+                "label": "JEV omitted an answer or probability; human review is required",
+                "model": data.get("model", self.model),
+                "answers": answers,
+                "malformed_questions": malformed,
+                "usage": data.get("usage", {}),
+            }
+        return {
+            "provider": self.name,
+            "status": "complete",
+            "label": "JEV returned typed decisions",
+            "model": data.get("model", self.model),
+            "answers": answers,
+            "usage": data.get("usage", {}),
+        }
+
+    def validate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        questions, metadata = _jev_questions(payload.get("lines", []))
+        state = {
+            "service_date": payload.get("service_date"),
+            "setting": payload.get("setting"),
+            "deidentified": payload.get("deidentified"),
+            "clinical_facts": payload.get("clinical_facts", []),
+            "proposed_coding_lines": payload.get("lines", []),
+        }
+        output = self.decide(state, questions)
+        if output.get("status") != "complete":
+            return output
+        answers = output.get("answers", {})
         decisions: list[dict[str, Any]] = []
         for key, details in metadata.items():
             answer = answers.get(key, {})
-            probability = answer.get("noul") if answer.get("type") == "noul" else None
+            probability = _noul_probability(answer)
             decisions.append({**details, "question": key, "probability": probability})
         probabilities = [item["probability"] for item in decisions if item["probability"] is not None]
-        confirmed = len(probabilities) == len(decisions) and all(value >= 0.8 for value in probabilities)
+        confirmed = len(probabilities) == len(decisions) and all(
+            value >= self.accept_threshold for value in probabilities
+        )
         return {
             "provider": self.name,
             "status": "confirmed" if confirmed else "requires_review",
             "label": (
-                "Jev confirmed every proposed line and modifier"
+                "JEV confirmed every proposed line and modifier"
                 if confirmed
-                else "One or more Jev decisions require human review"
+                else "One or more JEV decisions require human review"
             ),
-            "model": data.get("model", self.model),
+            "model": output.get("model", self.model),
             "answers": answers,
             "decisions": decisions,
-            "usage": data.get("usage", {}),
+            "usage": output.get("usage", {}),
         }
+
+
+def _noul_probability(answer: Any) -> float | None:
+    if not isinstance(answer, dict):
+        return None
+    value = answer.get("noul")
+    if value is None:
+        value = answer.get("probability")
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (float, int)) and 0 <= float(value) <= 1:
+        return float(value)
+    return None
+
+
+def _typed_answer_valid(question_type: Any, answer: Any) -> bool:
+    if not isinstance(answer, dict):
+        return False
+    if question_type == "noul":
+        return _noul_probability(answer) is not None
+    if question_type == "choice":
+        choice = answer.get("choice", answer.get("value", answer.get("answer")))
+        distribution = answer.get("probabilities") or answer.get("distribution")
+        if choice is None and isinstance(distribution, dict) and distribution:
+            choice = max(distribution, key=distribution.get)  # type: ignore[arg-type]
+        if not isinstance(choice, str):
+            return False
+        probability = answer.get("probability", answer.get("confidence"))
+        if isinstance(distribution, dict):
+            probability = distribution.get(choice, probability)
+        return isinstance(probability, (float, int)) and not isinstance(probability, bool)
+    if question_type == "score":
+        score = answer.get("score", answer.get("value"))
+        probability = answer.get("probability", answer.get("confidence"))
+        distribution = answer.get("probabilities") or answer.get("distribution")
+        return isinstance(score, (float, int)) and (
+            isinstance(probability, (float, int))
+            or isinstance(distribution, (dict, list))
+        )
+    return False
 
 
 def _jev_questions(
@@ -359,5 +505,7 @@ def get_reasoning_provider(settings: Settings) -> ClinicalReasoningProvider:
 
 def get_jev_provider(settings: Settings) -> JevProvider:
     if settings.jev_enabled:
+        if not (settings.jev_api_key and settings.jev_base_url and settings.jev_model):
+            return UnavailableJevProvider(settings)
         return TypeSafeJevProvider(settings)
     return MockJevProvider()

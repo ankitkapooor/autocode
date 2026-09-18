@@ -4,25 +4,40 @@ import hashlib
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from app.coding.document import ExtractedPage
 from app.coding.processing import ChartProcessor
 from app.coding.providers import MockJevProvider, ProviderResult
 from app.config import Settings
 from app.models.reference import (
+    AddonCodeRelation,
     CodeEntry,
     CodeSearchDocument,
     CodebookRelease,
+    ModifierEntry,
+    NcciPtpEdit,
     RawReferenceFile,
     ReferenceImportRun,
     new_id,
 )
-from app.models.workflow import Chart, CodingResult, EvidenceSpan, ModelRun, RuleDecision
+from app.models.workflow import (
+    CandidateCode,
+    Chart,
+    CodingResult,
+    EvidenceSpan,
+    ModelRun,
+    RuleDecision,
+)
 from app.storage import chart_storage
 
 
 class FakeDocumentExtractor:
+    def __init__(self, text: str | None = None):
+        self.text = text or "Arthroscopic rotator cuff repair was performed on the right shoulder."
+
     def extract(self, _path: Path) -> list[ExtractedPage]:
-        text = "Arthroscopic rotator cuff repair was performed on the right shoulder."
+        text = self.text
         return [
             ExtractedPage(
                 page_number=1,
@@ -39,26 +54,50 @@ class FakeProvider:
     provider_name = "test"
     model = "deterministic-test-model"
 
+    def __init__(
+        self,
+        *,
+        facts: list[dict] | None = None,
+        search_queries: list[str] | None = None,
+        selected_codes: list[str] | None = None,
+        fail_on_select: bool = False,
+    ):
+        self.facts = facts
+        self.search_queries = search_queries
+        self.selected_codes = selected_codes or ["29827"]
+        self.fail_on_select = fail_on_select
+        self.extract_calls = 0
+        self.select_calls = 0
+
     def extract_facts(self, evidence):  # type: ignore[no-untyped-def]
+        self.extract_calls += 1
         evidence_id = evidence[0]["evidence_span_id"]
+        facts = self.facts or [
+            {
+                "fact_type": "procedure",
+                "value": "arthroscopic rotator cuff repair",
+                "normalized_value": "rotator cuff repair",
+                "assertion": "present",
+                "confidence": 0.98,
+            }
+        ]
         data = {
             "summary": "Documented arthroscopic rotator cuff repair.",
-            "search_queries": ["rotator cuff repair"],
+            "search_queries": self.search_queries or [
+                str(item.get("normalized_value") or item.get("value")) for item in facts
+            ],
             "facts": [
-                {
-                    "fact_type": "procedure",
-                    "value": "arthroscopic rotator cuff repair",
-                    "normalized_value": "rotator cuff repair",
-                    "assertion": "present",
-                    "confidence": 0.98,
-                    "evidence_span_ids": [evidence_id],
-                }
+                {**item, "evidence_span_ids": item.get("evidence_span_ids") or [evidence_id]}
+                for item in facts
             ],
         }
         return ProviderResult(data, {"input_tokens": 10}, self.model, "facts-fingerprint")
 
     def select_codes(self, facts, candidates, service_date):  # type: ignore[no-untyped-def]
-        candidate = next(item for item in candidates if item["code"] == "29827")
+        self.select_calls += 1
+        if self.fail_on_select:
+            raise AssertionError("select_codes must not be called")
+        selected = [item for item in candidates if item["code"] in self.selected_codes]
         data = {
             "summary": "CPT 29827 is directly supported by the operative statement.",
             "lines": [
@@ -72,9 +111,232 @@ class FakeProvider:
                     "rationale": "Documented arthroscopic rotator cuff repair.",
                     "evidence_span_ids": facts[0]["evidence_span_ids"],
                 }
+                for candidate in selected
             ],
         }
         return ProviderResult(data, {"input_tokens": 20}, self.model, "coding-fingerprint")
+
+
+class ScriptedJevProvider:
+    name = "typesafe_jev"
+    model = "jev-test"
+
+    def __init__(
+        self,
+        *,
+        fact_classes: dict[str, str] | None = None,
+        code_by_fact: dict[str, str] | None = None,
+        unavailable: bool = False,
+    ):
+        self.fact_classes = fact_classes or {}
+        self.code_by_fact = code_by_fact or {}
+        self.unavailable = unavailable
+        self.calls: list[set[str]] = []
+
+    def decide(self, state, questions):  # type: ignore[no-untyped-def]
+        self.calls.append(set(questions))
+        if self.unavailable:
+            return {
+                "provider": self.name,
+                "model": self.model,
+                "status": "unavailable",
+                "label": "simulated JEV outage",
+                "answers": {},
+            }
+        evidence = " ".join(item.get("text", "") for item in state.get("evidence", [])).lower()
+        answers = {}
+        for key, question in questions.items():
+            if question["type"] == "choice":
+                instructions = question["instructions"].lower()
+                criteria = question["criteria"]
+                if key.startswith("fact_"):
+                    choice = next(
+                        (
+                            classification
+                            for phrase, classification in self.fact_classes.items()
+                            if phrase.lower() in instructions
+                        ),
+                        "performed" if "procedure fact" in instructions else (
+                            "active" if "diagnosis fact" in instructions else "supported"
+                        ),
+                    )
+                else:
+                    target = next(
+                        (
+                            code
+                            for phrase, code in self.code_by_fact.items()
+                            if phrase.lower() in instructions
+                        ),
+                        None,
+                    )
+                    choice = next(
+                        (
+                            option
+                            for option, description in criteria.items()
+                            if target and f" {target}:" in description
+                        ),
+                        next(option for option in criteria if option.startswith("candidate_")),
+                    )
+                answers[key] = {
+                    "type": "choice",
+                    "choice": choice,
+                    "probabilities": {choice: 0.96},
+                }
+            else:
+                instructions = question["instructions"].lower()
+                probability = 0.95
+                if "modifier rt" in instructions and "right" not in evidence:
+                    probability = 0.05
+                elif "modifier lt" in instructions and "left" not in evidence:
+                    probability = 0.05
+                elif "modifier 50" in instructions and not (
+                    "bilateral" in evidence or ("left" in evidence and "right" in evidence)
+                ):
+                    probability = 0.05
+                elif "modifier 51" in instructions or "modifier 80" in instructions:
+                    probability = 0.05
+                elif "ncci pair" in instructions and "separate incision" not in evidence:
+                    probability = 0.05
+                answers[key] = {"type": "noul", "noul": probability}
+        return {
+            "provider": self.name,
+            "model": self.model,
+            "status": "complete",
+            "answers": answers,
+            "usage": {},
+        }
+
+    def validate(self, payload):  # type: ignore[no-untyped-def]
+        return {
+            "provider": self.name,
+            "model": self.model,
+            "status": "confirmed",
+            "decisions": [],
+            "answers": {},
+        }
+
+
+def _settings(tmp_path: Path, mode: str) -> Settings:
+    return Settings(
+        _env_file=None,
+        app_env="test",
+        database_url="sqlite+pysqlite:///:memory:",
+        redis_url=None,
+        storage_provider="local",
+        local_storage_path=tmp_path,
+        openai_api_key="test",
+        llm_model="test",
+        coding_decision_engine=mode,
+        autonomous_coding_enabled=False,
+    )
+
+
+def _seed_chart(
+    session,  # type: ignore[no-untyped-def]
+    settings: Settings,
+    *,
+    text: str,
+    codes: list[dict],
+    modifiers: list[str] | None = None,
+) -> tuple[Chart, CodebookRelease, RawReferenceFile]:
+    run = ReferenceImportRun(
+        id=new_id(),
+        status="published",
+        source_root="test",
+        release_name="2026-test",
+        parser_version="test",
+        source_manifest_sha256="d" * 64,
+        published=True,
+        summary={},
+    )
+    session.add(run)
+    session.flush()
+    source = RawReferenceFile(
+        id=new_id(),
+        import_run_id=run.id,
+        original_filename="licensed.txt",
+        relative_path="licensed.txt",
+        source_family="cpt_licensed",
+        file_size=1,
+        sha256="e" * 64,
+        parser_version="test",
+        metadata_json={"licensed_boundary": True},
+    )
+    session.add(source)
+    release = CodebookRelease(
+        id=new_id(),
+        import_run_id=run.id,
+        name="2026-test",
+        status="published",
+        effective_from=date(2026, 1, 1),
+        source_manifest_sha256="d" * 64,
+        parser_version="test",
+        validation_summary={},
+    )
+    session.add(release)
+    session.flush()
+    for row in codes:
+        entry = CodeEntry(
+            id=new_id(),
+            codebook_release_id=release.id,
+            code_system=row.get("code_system", "CPT"),
+            code=row["code"],
+            code_key=row["code"].replace(".", "").upper(),
+            short_description=row["description"],
+            long_description=row["description"],
+            effective_from=date(2026, 1, 1),
+            billable=True,
+            category="Category I",
+            chapter="Test",
+            metadata_json=row.get("metadata", {"licensed_boundary": True}),
+            source_version="2026",
+            source_file_id=source.id,
+        )
+        session.add(entry)
+        session.flush()
+        session.add(
+            CodeSearchDocument(
+                id=new_id(),
+                codebook_release_id=release.id,
+                code_entry_id=entry.id,
+                code=entry.code,
+                description=entry.long_description,
+                synonyms=[],
+                search_text=f"{entry.code} {entry.long_description}".lower(),
+                embedding=None,
+            )
+        )
+    for modifier in modifiers or []:
+        session.add(
+            ModifierEntry(
+                id=new_id(),
+                codebook_release_id=release.id,
+                modifier=modifier,
+                modifier_key=modifier,
+                description=f"Test modifier {modifier}",
+                type="HCPCS_LEVEL_II",
+                compatible_code_families=[],
+                effective_from=date(2026, 1, 1),
+                metadata_json={},
+                source_version="2026",
+                source_file_id=source.id,
+            )
+        )
+    chart_id = new_id()
+    storage_key = chart_storage(settings).put_pdf(chart_id, b"%PDF-test")
+    chart = Chart(
+        id=chart_id,
+        original_filename="deidentified.pdf",
+        storage_key=storage_key,
+        sha256=hashlib.sha256(text.encode()).hexdigest(),
+        file_size=9,
+        service_date=date(2026, 9, 1),
+        setting="practitioner",
+        deidentified=True,
+    )
+    session.add(chart)
+    session.commit()
+    return chart, release, source
 
 
 def test_chart_processing_preserves_evidence_and_applies_gate(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -188,3 +450,476 @@ def test_chart_processing_preserves_evidence_and_applies_gate(session, tmp_path:
     assert session.query(EvidenceSpan).count() == 1
     assert session.query(ModelRun).count() == 2
     assert {item.outcome for item in session.query(RuleDecision)} == {"pass", "warning"}
+
+
+def test_jev_primary_calls_extraction_but_never_openai_code_selection(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "Arthroscopic rotator cuff repair was performed on the right shoulder."
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[{"code": "29827", "description": "arthroscopic rotator cuff repair"}],
+    )
+    provider = FakeProvider(fail_on_select=True)
+    jev = ScriptedJevProvider(code_by_fact={"rotator cuff": "29827"})
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert provider.extract_calls == 1
+    assert provider.select_calls == 0
+    assert jev.calls
+    assert result.lines[0].code == "29827"
+    assert result.lines[0].source == "jev_decision_engine"
+    assert result.lines[0].confidence == 0.96
+    candidate = session.query(CandidateCode).filter_by(code="29827").one()
+    assert candidate.selected is True
+    assert candidate.model_confidence == 0.96
+    assert result.jev_output["mode"] == "primary"
+
+
+def test_jev_primary_planned_not_performed_procedure_is_not_coded(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = (
+        "Carpal tunnel release was considered preoperatively. "
+        "Carpal tunnel release was not performed."
+    )
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[{"code": "64721", "description": "open carpal tunnel release"}],
+    )
+    provider = FakeProvider(
+        facts=[
+            {
+                "fact_type": "procedure",
+                "value": "carpal tunnel release",
+                "normalized_value": "carpal tunnel release",
+                "assertion": "uncertain",
+                "confidence": 0.99,
+            }
+        ],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(
+        fact_classes={"carpal tunnel release": "planned_only"},
+        code_by_fact={"carpal tunnel": "64721"},
+    )
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert provider.select_calls == 0
+    assert result.lines == []
+    assert result.confidence_state == "RED"
+    assert result.jev_output["facts"][0]["classification"] == "planned_only"
+
+
+def test_jev_primary_left_laterality_is_evidence_backed_without_rt(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "Left knee arthroscopy with meniscectomy was performed during this operative session."
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[{"code": "29881", "description": "knee arthroscopy with meniscectomy"}],
+        modifiers=["LT", "RT"],
+    )
+    provider = FakeProvider(
+        facts=[
+            {"fact_type": "procedure", "value": "knee arthroscopy with meniscectomy", "normalized_value": "knee arthroscopy with meniscectomy", "assertion": "present", "confidence": 0.98},
+            {"fact_type": "laterality", "value": "left", "normalized_value": "left", "assertion": "present", "confidence": 0.99},
+        ],
+        selected_codes=["29881"],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(code_by_fact={"meniscectomy": "29881"})
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert result.lines[0].modifiers == ["LT"]
+    assert "RT" not in result.lines[0].modifiers
+    lt_decision = next(
+        item for item in result.jev_output["modifier_decisions"] if item["modifier"] == "LT"
+    )
+    assert lt_decision["applied"] is True
+    assert result.lines[0].evidence_span_ids
+
+
+def test_jev_primary_bilateral_context_uses_active_modifier_50(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = (
+        "Open carpal tunnel release was performed on the right wrist and left wrist "
+        "during the same operative session."
+    )
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[{"code": "64721", "description": "open carpal tunnel release"}],
+        modifiers=["50", "LT", "RT"],
+    )
+    provider = FakeProvider(
+        facts=[
+            {"fact_type": "procedure", "value": "bilateral open carpal tunnel release", "normalized_value": "open carpal tunnel release", "assertion": "present", "confidence": 0.98},
+            {"fact_type": "laterality", "value": "right", "normalized_value": "right", "assertion": "present", "confidence": 0.99},
+            {"fact_type": "laterality", "value": "left", "normalized_value": "left", "assertion": "present", "confidence": 0.99},
+        ],
+        selected_codes=["64721"],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(code_by_fact={"carpal tunnel": "64721"})
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert result.lines[0].modifiers == ["50"]
+
+
+def test_jev_primary_failure_preserves_facts_and_candidates_without_fallback(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "Arthroscopic rotator cuff repair was performed on the right shoulder."
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[{"code": "29827", "description": "arthroscopic rotator cuff repair"}],
+    )
+    provider = FakeProvider(fail_on_select=True)
+    jev = ScriptedJevProvider(unavailable=True)
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert provider.select_calls == 0
+    assert session.query(CandidateCode).count() == 1
+    assert result.lines == []
+    assert result.status == "needs_review"
+    assert result.confidence_state == "RED"
+    assert result.autonomous_eligible is False
+    assert result.jev_output["error_code"] == "JEV_UNAVAILABLE"
+    assert any(item["code"] == "JEV_UNAVAILABLE" for item in result.warnings)
+
+
+def test_jev_shadow_keeps_legacy_lines_and_persists_comparison(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_shadow")
+    text = "Arthroscopic rotator cuff repair was performed on the right shoulder."
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[{"code": "29827", "description": "arthroscopic rotator cuff repair"}],
+    )
+    provider = FakeProvider()
+    jev = ScriptedJevProvider(code_by_fact={"rotator cuff": "29827"})
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert provider.select_calls == 1
+    assert result.lines[0].source == "reasoning_model"
+    assert result.jev_output["mode"] == "shadow"
+    assert result.jev_output["shadow"]["code_selections"]
+    assert result.jev_output["comparison"]["exact_code_set_agreement"] is True
+
+
+def test_jev_primary_addon_selection_still_requires_deterministic_primary(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "Primary lumbar procedure and documented add-on decompression were both performed."
+    chart, release, source = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {"code": "63047", "description": "primary lumbar decompression"},
+            {"code": "63048", "description": "add-on lumbar decompression segment"},
+        ],
+    )
+    session.add(
+        AddonCodeRelation(
+            id=new_id(),
+            codebook_release_id=release.id,
+            addon_code="63048",
+            addon_code_key="63048",
+            primary_code="63047",
+            primary_code_key="63047",
+            relationship_type="explicit_primary",
+            effective_from=date(2026, 1, 1),
+            source_file_id=source.id,
+            metadata_json={},
+        )
+    )
+    session.commit()
+    provider = FakeProvider(
+        facts=[
+            {"fact_type": "procedure", "value": "primary lumbar decompression", "normalized_value": "primary lumbar decompression", "assertion": "present", "confidence": 0.98},
+            {"fact_type": "procedure", "value": "add-on lumbar decompression segment", "normalized_value": "add-on lumbar decompression segment", "assertion": "present", "confidence": 0.98},
+        ],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(
+        code_by_fact={"primary lumbar": "63047", "add-on lumbar": "63048"}
+    )
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert {line.code for line in result.lines} == {"63047", "63048"}
+    addon = session.query(RuleDecision).filter_by(rule_type="addon_primary").one()
+    assert addon.outcome == "pass"
+
+
+def test_addon_without_required_primary_fails_regardless_of_jev_confidence(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "Only the add-on lumbar decompression segment was documented as performed today."
+    chart, release, source = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {"code": "63047", "description": "primary lumbar decompression"},
+            {"code": "63048", "description": "add-on lumbar decompression segment"},
+        ],
+    )
+    session.add(
+        AddonCodeRelation(
+            id=new_id(),
+            codebook_release_id=release.id,
+            addon_code="63048",
+            addon_code_key="63048",
+            primary_code="63047",
+            primary_code_key="63047",
+            relationship_type="explicit_primary",
+            effective_from=date(2026, 1, 1),
+            source_file_id=source.id,
+            metadata_json={},
+        )
+    )
+    session.commit()
+    provider = FakeProvider(
+        facts=[
+            {"fact_type": "procedure", "value": "add-on lumbar decompression segment", "normalized_value": "add-on lumbar decompression segment", "assertion": "present", "confidence": 0.99}
+        ],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(code_by_fact={"add-on lumbar": "63048"})
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    addon = session.query(RuleDecision).filter_by(rule_type="addon_primary").one()
+    assert addon.outcome == "fail"
+    assert result.confidence_state == "RED"
+
+
+def test_hcpcs_units_are_calculated_in_python_from_administered_quantity(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "Triamcinolone 40 mg was administered into the knee joint during this encounter."
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {"code": "00000", "description": "licensed CPT gate placeholder"},
+            {
+                "code_system": "HCPCS",
+                "code": "J3301",
+                "description": "triamcinolone acetonide per 10 mg",
+                "metadata": {"billing_unit_mg": 10},
+            },
+        ],
+    )
+    provider = FakeProvider(
+        facts=[
+            {"fact_type": "medication", "value": "triamcinolone administered", "normalized_value": "triamcinolone", "assertion": "present", "confidence": 0.99},
+            {"fact_type": "quantity", "value": "40 mg administered", "normalized_value": "40 mg", "assertion": "present", "confidence": 0.99},
+        ],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(code_by_fact={"triamcinolone": "J3301"})
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert result.lines[0].code == "J3301"
+    assert result.lines[0].units == 4
+
+
+def test_diagnosis_pointers_come_from_jev_relationship_decisions(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "Right rotator cuff tear was treated with arthroscopic rotator cuff repair."
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {"code": "29827", "description": "arthroscopic rotator cuff repair"},
+            {"code_system": "ICD10CM", "code": "M75.121", "description": "complete right rotator cuff tear"},
+        ],
+    )
+    provider = FakeProvider(
+        facts=[
+            {"fact_type": "procedure", "value": "arthroscopic rotator cuff repair", "normalized_value": "rotator cuff repair", "assertion": "present", "confidence": 0.99},
+            {"fact_type": "diagnosis", "value": "complete right rotator cuff tear", "normalized_value": "right rotator cuff tear", "assertion": "present", "confidence": 0.99},
+        ],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(
+        code_by_fact={"repair": "29827", "tear": "M75.121"}
+    )
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    procedure = next(line for line in result.lines if line.code == "29827")
+    assert procedure.diagnosis_pointers == ["M75.121"]
+    assert result.jev_output["diagnosis_links"][0]["linked"] is True
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_outcome", "expected_modifier"),
+    [
+        (
+            "Rotator cuff repair and decompression were performed through the same operative field.",
+            "fail",
+            False,
+        ),
+        (
+            "Rotator cuff repair and decompression were performed through a documented separate incision.",
+            "pass",
+            True,
+        ),
+    ],
+)
+def test_ncci_modifier_indicator_one_uses_jev_for_documentation_only(
+    session,
+    tmp_path: Path,
+    text: str,
+    expected_outcome: str,
+    expected_modifier: bool,
+) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    chart, release, source = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {"code": "29827", "description": "arthroscopic rotator cuff repair"},
+            {"code": "29826", "description": "arthroscopic decompression"},
+        ],
+        modifiers=["59"],
+    )
+    session.add(
+        NcciPtpEdit(
+            id=new_id(),
+            codebook_release_id=release.id,
+            setting="practitioner",
+            revision_key=new_id(),
+            column_1_code="29827",
+            column_1_code_key="29827",
+            column_2_code="29826",
+            column_2_code_key="29826",
+            effective_from=date(2026, 1, 1),
+            modifier_indicator="1",
+            source_file_id=source.id,
+            source_record={},
+        )
+    )
+    session.commit()
+    provider = FakeProvider(
+        facts=[
+            {"fact_type": "procedure", "value": "arthroscopic rotator cuff repair", "normalized_value": "rotator cuff repair", "assertion": "present", "confidence": 0.99},
+            {"fact_type": "procedure", "value": "arthroscopic decompression", "normalized_value": "arthroscopic decompression", "assertion": "present", "confidence": 0.99},
+        ],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(
+        code_by_fact={"rotator cuff": "29827", "decompression": "29826"}
+    )
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    ncci = session.query(RuleDecision).filter_by(rule_type="ncci_ptp").one()
+    assert ncci.outcome == expected_outcome
+    assert any("59" in line.modifiers for line in result.lines) is expected_modifier

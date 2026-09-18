@@ -10,16 +10,35 @@ OrthoCode AI is an evidence-first orthopedic medical-coding platform. Its runtim
 - Staged canonical normalization, validation reports, release fingerprints, and atomic publication
 - Runtime repositories for code lookup, effective-date checks, NCCI, MUE, add-on relationships, and PFS attributes
 - De-identified PDF upload, per-page text extraction, evidence spans, and bounded model inputs
-- OpenAI Responses API Structured Outputs with `store=false` for clinical facts and constrained code selection
-- Published-codebook candidate retrieval and evidence-only reasoning
+- OpenAI Responses API Structured Outputs with `store=false` for atomic, evidence-linked clinical fact extraction
+- Published-codebook candidate retrieval with no free-form code generation
+- Three decision-engine modes: `legacy_llm`, `jev_shadow`, and `jev_primary`
+- Batched TypeSafe JEV fact validation, bounded code selection, modifier decisions, diagnosis relationships, and NCCI documentation-exception decisions
 - Deterministic active-code, modifier, NCCI PTP, MUE, add-on, and PFS checks
-- GREEN/YELLOW/RED calibration with autonomy disabled by default
+- Deterministic HCPCS unit arithmetic from validated administered quantities
+- JEV-authoritative GREEN/YELLOW/RED calibration with configurable accept/review thresholds and autonomy disabled by default
 - Append-only human reviews/corrections and gold-set evaluation metrics
 - FastAPI chart, coding, review, evaluation, administration, and code-search endpoints
 - Next.js operations, upload, processing, review, evaluation, and reference-data screens
 - Parser, repository, workflow, validation, and raw-data-boundary tests
 
 The supplied bundle passes structural validation with 11,525 licensed 2026 CPT codes and 4.49 million directional NCCI PTP revisions. Chart processing remains locked unless the active published release includes licensed CPT records for the service date.
+
+## Decision-engine migration
+
+`CODING_DECISION_ENGINE=legacy_llm` preserves the original OpenAI selection followed by JEV verification and is the rollback mode. `jev_shadow` keeps that legacy result user-facing while persisting a separately computed JEV decision graph and agreement metrics. `jev_primary` uses OpenAI only to structure chart evidence; TypeSafe JEV makes the uncertain coding decisions over active retrieved candidates, and Python applies deterministic rules and arithmetic. Primary mode never falls back to OpenAI code selection when JEV is unavailable.
+
+The safe initial configuration is:
+
+```bash
+CODING_DECISION_ENGINE=legacy_llm
+JEV_ENABLED=false
+JEV_ACCEPT_THRESHOLD=0.80
+JEV_REVIEW_THRESHOLD=0.50
+AUTONOMOUS_CODING_ENABLED=false
+```
+
+Operators can move deliberately from `legacy_llm` to `jev_shadow` and then to `jev_primary` after validating the persisted comparison and evaluation metrics.
 
 ## Local development
 

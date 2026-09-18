@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -35,11 +36,14 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     autonomous_coding_enabled: bool = False
 
+    coding_decision_engine: Literal["legacy_llm", "jev_shadow", "jev_primary"] = "legacy_llm"
     jev_enabled: bool = False
     jev_api_key: str | None = None
     jev_base_url: str | None = None
     jev_model: str | None = None
     jev_phi_allowed: bool = False
+    jev_accept_threshold: float = Field(default=0.80, ge=0.0, le=1.0)
+    jev_review_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
 
     reference_data_path: Path = Path("../ortho_coding_reference_bundle/reference_data")
     ncci_index_path: Path = Path(".data/reference/ncci-index.json")
@@ -60,6 +64,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def enforce_phi_boundary(self) -> "Settings":
+        if self.jev_review_threshold > self.jev_accept_threshold:
+            raise ValueError("JEV_REVIEW_THRESHOLD cannot exceed JEV_ACCEPT_THRESHOLD")
         if not self.phi_mode:
             return self
         missing: list[str] = []

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import httpx
+import pytest
+from pydantic import ValidationError
 
-from app.coding.providers import TypeSafeJevProvider
+from app.coding.jev import parse_choice
+from app.coding.providers import MockJevProvider, TypeSafeJevProvider, get_jev_provider
 from app.config import Settings
 
 
@@ -68,3 +71,120 @@ def test_typesafe_jev_adapter_blocks_unapproved_phi() -> None:
     )
 
     assert output["status"] == "blocked_phi"
+
+
+def test_typesafe_jev_adapter_supports_choice_and_score_batches() -> None:
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(__import__("json").loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": "jev-test",
+                "answers": {
+                    "code": {
+                        "type": "choice",
+                        "choice": "cpt_29827",
+                        "probabilities": {"cpt_29827": 0.94, "NONE": 0.06},
+                    },
+                    "ambiguity": {"type": "score", "score": 1.2, "confidence": 0.91},
+                },
+            },
+        )
+
+    settings = Settings(
+        _env_file=None,
+        jev_enabled=True,
+        jev_api_key="test-key",
+        jev_base_url="https://api.typesafe.ai",
+        jev_model="jev-test",
+    )
+    provider = TypeSafeJevProvider(
+        settings, client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    questions = {
+        "code": {
+            "type": "choice",
+            "instructions": "Choose a code",
+            "criteria": {"cpt_29827": "CPT 29827", "NONE": "Abstain"},
+        },
+        "ambiguity": {
+            "type": "score",
+            "instructions": "Score ambiguity",
+            "criteria": ["none", "moderate", "high"],
+        },
+    }
+
+    output = provider.decide({"deidentified": True}, questions)
+
+    assert output["status"] == "complete"
+    assert captured["questions"] == questions
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(500, json={"error": "failure"}),
+        httpx.Response(200, content=b"not-json"),
+        httpx.Response(200, json={"answers": []}),
+        httpx.Response(200, json={"answers": {}}),
+        httpx.Response(
+            200,
+            json={"answers": {"decision": {"type": "noul"}}},
+        ),
+    ],
+)
+def test_typesafe_jev_failures_return_safe_noncomplete_status(response: httpx.Response) -> None:
+    settings = Settings(
+        _env_file=None,
+        jev_enabled=True,
+        jev_api_key="test-key",
+        jev_base_url="https://api.typesafe.ai",
+        jev_model="jev-test",
+    )
+    provider = TypeSafeJevProvider(
+        settings,
+        client=httpx.Client(transport=httpx.MockTransport(lambda _request: response)),
+    )
+
+    output = provider.decide(
+        {"deidentified": True},
+        {"decision": {"type": "noul", "instructions": "Is it supported?"}},
+    )
+
+    assert output["status"] in {"unavailable", "malformed"}
+
+
+def test_mock_jev_is_explicitly_unavailable_for_primary_decisions() -> None:
+    output = MockJevProvider().decide(
+        {"deidentified": True},
+        {"decision": {"type": "noul", "instructions": "Is it supported?"}},
+    )
+    assert output["status"] == "unavailable"
+
+
+def test_incomplete_enabled_provider_configuration_is_safely_unavailable() -> None:
+    provider = get_jev_provider(Settings(_env_file=None, jev_enabled=True))
+    output = provider.decide(
+        {"deidentified": True},
+        {"decision": {"type": "noul", "instructions": "Is it supported?"}},
+    )
+    assert output["status"] == "unavailable"
+    assert output["provider"] == "typesafe_jev"
+
+
+def test_choice_parser_rejects_unknown_candidate_and_missing_probability() -> None:
+    unknown = parse_choice(
+        {"choice": "hallucinated", "probability": 0.99}, {"candidate_0", "NONE"}
+    )
+    missing = parse_choice({"choice": "candidate_0"}, {"candidate_0", "NONE"})
+    assert unknown.valid is False
+    assert unknown.error == "out_of_set_choice"
+    assert missing.valid is False
+    assert missing.error == "missing_probability"
+
+
+def test_jev_thresholds_must_be_ordered() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, jev_accept_threshold=0.4, jev_review_threshold=0.6)

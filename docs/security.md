@@ -9,6 +9,8 @@ The development profile is for de-identified charts only. `PHI_MODE=true` is rej
 - The frontend receives no provider secrets and no source files.
 - Autonomous coding remains disabled by default.
 - OpenAI requests use Structured Outputs and explicitly set `store=false`.
+- TypeSafe JEV receives only bounded decision state and cited de-identified evidence spans. `JEV_PHI_ALLOWED=false` remains the default.
+- JEV failures never trigger a silent OpenAI coding fallback in `jev_primary`; they create a safe review result with no fabricated lines.
 - Development uploads are rejected unless the operator confirms they are de-identified.
 - Model runs retain fingerprints, counts, structured outputs, and token usage—not raw request prompts in ordinary logs.
 

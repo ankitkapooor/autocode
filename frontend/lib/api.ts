@@ -59,6 +59,27 @@ export type CodingSummary = {
   warnings: Array<{ code: string; message: string }>;
   jev_provider: string;
   jev_output: Record<string, unknown>;
+  decision_engine: "legacy_llm" | "jev";
+  decision_engine_mode: "legacy_llm" | "jev_shadow" | "jev_primary";
+  jev_summary: {
+    decision_count?: number;
+    accepted?: number;
+    review?: number;
+    rejected?: number;
+  };
+  jev_decisions: Array<{
+    question?: string;
+    fact?: string;
+    classification?: string;
+    code_system?: string;
+    code?: string;
+    modifier?: string;
+    diagnosis_code?: string;
+    probability?: number | null;
+    status?: string;
+    evidence_span_ids?: string[];
+    alternatives?: Array<{ code?: string; description?: string | null; probability?: number }>;
+  }>;
   autonomous_eligible: boolean;
   created_at: string;
   updated_at: string;
@@ -77,6 +98,7 @@ export type CodingResult = CodingSummary & {
     confidence: number;
     rationale: string;
     evidence_span_ids: string[];
+    source: string;
   }>;
   rule_decisions: Array<{
     id: string;

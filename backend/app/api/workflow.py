@@ -322,6 +322,7 @@ def chart_coding(chart_id: str, session: Session = Depends(get_session)) -> dict
                 "confidence": line.confidence,
                 "rationale": line.rationale,
                 "evidence_span_ids": line.evidence_span_ids,
+                "source": line.source,
             }
             for line in lines
         ],
@@ -442,7 +443,10 @@ def run_evaluation(payload: EvaluationRequest, session: Session = Depends(get_se
     )
     session.add(run)
     session.flush()
-    exact = predicted_total = expected_total = true_positive = 0
+    exact = exact_lines = predicted_total = expected_total = true_positive = 0
+    matched_lines = modifier_matches = unit_matches = pointer_matches = 0
+    jev_covered = jev_decisions = jev_review_or_abstain = deterministic_failures = 0
+    calibration_error = 0.0
     evaluated = 0
     for item in gold:
         if not item.chart_id:
@@ -452,16 +456,88 @@ def run_evaluation(payload: EvaluationRequest, session: Session = Depends(get_se
         )
         if result is None:
             continue
-        predicted = {
-            (line.code_system, line.code)
-            for line in session.scalars(select(CodingLine).where(CodingLine.coding_result_id == result.id))
-        }
+        predicted_rows = list(
+            session.scalars(select(CodingLine).where(CodingLine.coding_result_id == result.id))
+        )
+        predicted = {(line.code_system, line.code) for line in predicted_rows}
         expected = {
             (str(row.get("code_system", "CPT")), str(row.get("code", "")))
             for row in item.expected_codes
             if row.get("code")
         }
         exact += predicted == expected
+        expected_by_code = {
+            (str(row.get("code_system", "CPT")), str(row.get("code", ""))): row
+            for row in item.expected_codes
+            if row.get("code")
+        }
+        predicted_line_set = {
+            (
+                line.code_system,
+                line.code,
+                int(line.units),
+                tuple(sorted(line.modifiers)),
+                tuple(sorted(line.diagnosis_pointers)),
+            )
+            for line in predicted_rows
+        }
+        expected_line_set = {
+            (
+                system,
+                code,
+                int(row.get("units", 1)),
+                tuple(sorted(str(value) for value in row.get("modifiers", []))),
+                tuple(sorted(str(value) for value in row.get("diagnosis_pointers", []))),
+            )
+            for (system, code), row in expected_by_code.items()
+        }
+        exact_lines += predicted_line_set == expected_line_set
+        for line in predicted_rows:
+            expected_row = expected_by_code.get((line.code_system, line.code))
+            correct = expected_row is not None
+            calibration_error += (line.confidence - float(correct)) ** 2
+            if expected_row is None:
+                continue
+            matched_lines += 1
+            modifier_matches += sorted(line.modifiers) == sorted(
+                str(value) for value in expected_row.get("modifiers", [])
+            )
+            unit_matches += line.units == int(expected_row.get("units", 1))
+            pointer_matches += sorted(line.diagnosis_pointers) == sorted(
+                str(value) for value in expected_row.get("diagnosis_pointers", [])
+            )
+        trace = result.jev_output.get("shadow", result.jev_output)
+        if isinstance(trace, dict) and trace.get("status") == "complete":
+            jev_covered += 1
+        if isinstance(trace, dict):
+            trace_decisions = [
+                decision
+                for key in (
+                    "facts",
+                    "code_selections",
+                    "modifier_decisions",
+                    "diagnosis_links",
+                    "rule_exception_decisions",
+                )
+                for decision in trace.get(key, [])
+                if isinstance(decision, dict)
+            ]
+            jev_decisions += len(trace_decisions)
+            jev_review_or_abstain += sum(
+                decision.get("status") in {"review", "rejected"}
+                or bool(decision.get("abstained"))
+                for decision in trace_decisions
+            )
+        deterministic_failures += bool(
+            session.scalar(
+                select(func.count())
+                .select_from(RuleDecision)
+                .where(
+                    RuleDecision.coding_result_id == result.id,
+                    RuleDecision.outcome == "fail",
+                )
+            )
+        )
         true_positive += len(predicted & expected)
         predicted_total += len(predicted)
         expected_total += len(expected)
@@ -471,6 +547,20 @@ def run_evaluation(payload: EvaluationRequest, session: Session = Depends(get_se
         "code_precision": true_positive / predicted_total if predicted_total else 0,
         "code_recall": true_positive / expected_total if expected_total else 0,
         "coverage": evaluated / len(gold),
+        "exact_line_match": exact_lines / evaluated if evaluated else 0,
+        "modifier_accuracy": modifier_matches / matched_lines if matched_lines else 0,
+        "unit_accuracy": unit_matches / matched_lines if matched_lines else 0,
+        "diagnosis_pointer_accuracy": pointer_matches / matched_lines if matched_lines else 0,
+        "jev_coverage": jev_covered / evaluated if evaluated else 0,
+        "jev_abstention_review_rate": (
+            jev_review_or_abstain / jev_decisions if jev_decisions else 0
+        ),
+        "confidence_brier_score": (
+            calibration_error / predicted_total if predicted_total else 0
+        ),
+        "deterministic_rule_failure_rate": (
+            deterministic_failures / evaluated if evaluated else 0
+        ),
     }
     for name, value in metrics.items():
         session.add(
@@ -530,6 +620,20 @@ def _chart_dict(chart: Chart) -> dict[str, Any]:
 
 
 def _result_summary(result: CodingResult) -> dict[str, Any]:
+    mode = str(result.jev_output.get("mode") or "legacy")
+    trace = result.jev_output.get("shadow", result.jev_output)
+    jev_decisions = [
+        item
+        for key in (
+            "facts",
+            "code_selections",
+            "modifier_decisions",
+            "diagnosis_links",
+            "rule_exception_decisions",
+        )
+        for item in trace.get(key, [])
+        if isinstance(item, dict)
+    ] if isinstance(trace, dict) else []
     return {
         "id": result.id,
         "status": result.status,
@@ -539,6 +643,13 @@ def _result_summary(result: CodingResult) -> dict[str, Any]:
         "warnings": result.warnings,
         "jev_provider": result.jev_provider,
         "jev_output": result.jev_output,
+        "decision_engine": "jev" if mode in {"primary", "shadow"} else "legacy_llm",
+        "decision_engine_mode": {
+            "primary": "jev_primary",
+            "shadow": "jev_shadow",
+        }.get(mode, "legacy_llm"),
+        "jev_summary": trace.get("summary", {}) if isinstance(trace, dict) else {},
+        "jev_decisions": jev_decisions,
         "autonomous_eligible": result.autonomous_eligible,
         "created_at": result.created_at,
         "updated_at": result.updated_at,
