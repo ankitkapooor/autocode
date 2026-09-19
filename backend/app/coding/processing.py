@@ -1364,33 +1364,86 @@ class ChartProcessor:
         ]
         questions: dict[str, dict[str, Any]] = {}
         metadata: dict[str, dict[str, Any]] = {}
+        link_contexts: dict[str, dict[str, Any]] = {}
+        question_state_refs: dict[str, dict[str, str]] = {}
+        span_text = {span.id: span.text[:4000] for span in spans}
         for procedure_index, procedure in enumerate(procedures):
             for diagnosis_index, diagnosis in enumerate(diagnoses):
                 procedure_candidate = procedure["candidate"]
                 diagnosis_candidate = diagnosis["candidate"]
                 key = decision_key("diagnosis_link", str(procedure_index), str(diagnosis_index))
+                link_ref = f"link_{procedure_index}_{diagnosis_index}"
+                evidence_ids = sorted(
+                    set(procedure.get("evidence_span_ids", []))
+                    | set(diagnosis.get("evidence_span_ids", []))
+                )
+                link_contexts[link_ref] = {
+                    "procedure": {
+                        "code_system": procedure_candidate.code_system,
+                        "code": procedure_candidate.code,
+                        "description": procedure_candidate.description,
+                        "facts": [
+                            fact.normalized_value or fact.value
+                            for fact in procedure.get("facts", [])
+                        ],
+                    },
+                    "diagnosis": {
+                        "code_system": diagnosis_candidate.code_system,
+                        "code": diagnosis_candidate.code,
+                        "description": diagnosis_candidate.description,
+                        "facts": [
+                            fact.normalized_value or fact.value
+                            for fact in diagnosis.get("facts", [])
+                        ],
+                    },
+                    "evidence": [
+                        {
+                            "evidence_span_id": evidence_id,
+                            "text": span_text[evidence_id],
+                        }
+                        for evidence_id in evidence_ids
+                        if evidence_id in span_text
+                    ],
+                }
                 questions[key] = {
                     "type": "noul",
                     "instructions": (
-                        f"Does diagnosis {diagnosis_candidate.code} support procedure "
-                        f"{procedure_candidate.code} for this encounter based on the source evidence?"
+                        f"Does documented diagnosis {diagnosis_candidate.code} "
+                        f"({diagnosis_candidate.description or 'no description'}) clinically "
+                        f"support procedure {procedure_candidate.code} "
+                        f"({procedure_candidate.description or 'no description'}) for this "
+                        f"encounter? Judge this relationship using "
+                        f"`diagnosis_link_decisions.{link_ref}`."
                     ),
                     "criteria": {
-                        "true": "The diagnosis is clinically related to and supports this procedure.",
-                        "false": "The diagnosis is unrelated, historical, ruled out, or unsupported.",
+                        "true": (
+                            "The active diagnosis directly explains the condition treated by this "
+                            "procedure in the cited encounter evidence."
+                        ),
+                        "false": (
+                            "The diagnosis is unrelated to the treated condition, historical, "
+                            "ruled out, or unsupported by the cited evidence."
+                        ),
                     },
                 }
+                question_state_refs[key] = {"link": link_ref}
                 metadata[key] = {
                     "procedure_system": procedure_candidate.code_system,
                     "procedure_code": procedure_candidate.code,
                     "diagnosis_code": diagnosis_candidate.code,
                 }
-        output = self._run_jev_decisions(
+        output = self._run_jev_decision_batches(
             chart,
             "jev_diagnosis_linkage",
-            self._jev_state(chart, facts, spans),
+            {
+                "service_date": chart.service_date.isoformat(),
+                "setting": chart.setting,
+                "deidentified": chart.deidentified,
+                "diagnosis_link_decisions": link_contexts,
+            },
             questions,
             {"procedures": len(procedures), "diagnoses": len(diagnoses), "questions": len(questions)},
+            question_state_refs=question_state_refs,
         )
         if output.get("status") != "complete":
             return output, []
@@ -1543,34 +1596,31 @@ class ChartProcessor:
         def state_for(question_keys: list[str]) -> dict[str, Any]:
             if not question_state_refs:
                 return state
-            fact_refs = {
-                question_state_refs[key]["fact"]
-                for key in question_keys
-                if key in question_state_refs
+            collection_refs = {
+                "coding_facts": "fact",
+                "candidate_decisions": "candidate",
+                "diagnosis_link_decisions": "link",
             }
-            candidate_refs = {
-                candidate_ref
-                for key in question_keys
-                if key in question_state_refs
-                and (candidate_ref := question_state_refs[key].get("candidate"))
+            filtered = {
+                key: value
+                for key, value in state.items()
+                if key not in collection_refs
             }
-            return {
-                **{
+            for collection, ref_name in collection_refs.items():
+                if collection not in state:
+                    continue
+                refs = {
+                    ref
+                    for key in question_keys
+                    if key in question_state_refs
+                    and (ref := question_state_refs[key].get(ref_name))
+                }
+                filtered[collection] = {
                     key: value
-                    for key, value in state.items()
-                    if key not in {"coding_facts", "candidate_decisions"}
-                },
-                "coding_facts": {
-                    key: value
-                    for key, value in state.get("coding_facts", {}).items()
-                    if key in fact_refs
-                },
-                "candidate_decisions": {
-                    key: value
-                    for key, value in state.get("candidate_decisions", {}).items()
-                    if key in candidate_refs
-                },
-            }
+                    for key, value in state.get(collection, {}).items()
+                    if key in refs
+                }
+            return filtered
 
         if len(questions) <= batch_size:
             return self._run_jev_decisions(

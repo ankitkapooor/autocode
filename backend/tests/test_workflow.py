@@ -1574,6 +1574,16 @@ def test_diagnosis_pointers_come_from_jev_relationship_decisions(session, tmp_pa
     procedure = next(line for line in result.lines if line.code == "29827")
     assert procedure.diagnosis_pointers == ["M75.121"]
     assert result.jev_output["diagnosis_links"][0]["linked"] is True
+    link_batch_index = next(
+        index
+        for index, batch in enumerate(jev.question_batches)
+        if any(key.startswith("diagnosis_link_") for key in batch)
+    )
+    link_question = next(iter(jev.question_batches[link_batch_index].values()))
+    assert "complete right rotator cuff tear" in link_question["instructions"]
+    assert "arthroscopic rotator cuff repair" in link_question["instructions"]
+    assert "`diagnosis_link_decisions.link_0_0`" in link_question["instructions"]
+    assert list(jev.states[link_batch_index]["diagnosis_link_decisions"]) == ["link_0_0"]
 
 
 @pytest.mark.parametrize(
