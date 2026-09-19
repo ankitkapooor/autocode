@@ -620,6 +620,82 @@ def test_jev_primary_bridges_open_carpal_tunnel_to_cpt_descriptor(
     assert "`candidate_decisions.decision_" in question["instructions"]
 
 
+def test_jev_primary_excludes_diagnostic_arthroscopy_included_in_surgical_scope(
+    session, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = (
+        "Diagnostic arthroscopy of the left knee was followed by arthroscopically aided "
+        "left ACL reconstruction during the same operative session."
+    )
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {
+                "code": "29870",
+                "description": "Arthroscopy, knee, diagnostic, with or without synovial biopsy",
+            },
+            {
+                "code": "29888",
+                "description": (
+                    "Arthroscopically aided anterior cruciate ligament repair/augmentation "
+                    "or reconstruction"
+                ),
+            },
+        ],
+    )
+    provider = FakeProvider(
+        facts=[
+            {
+                "fact_type": "procedure",
+                "value": "diagnostic arthroscopy of left knee",
+                "normalized_value": "diagnostic arthroscopy left knee",
+                "assertion": "present",
+                "confidence": 0.99,
+            },
+            {
+                "fact_type": "procedure",
+                "value": "arthroscopic left ACL reconstruction",
+                "normalized_value": "arthroscopic ACL reconstruction left knee",
+                "assertion": "present",
+                "confidence": 0.99,
+            },
+        ],
+        search_queries=["diagnostic knee arthroscopy", "arthroscopic ACL reconstruction"],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(
+        code_by_fact={
+            "diagnostic arthroscopy": "29870",
+            "acl reconstruction": "29888",
+        }
+    )
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert [line.code for line in result.lines] == ["29888"]
+    assert result.jev_output["deterministic_exclusions"] == [
+        {
+            "rule": "included_diagnostic_arthroscopy",
+            "code_system": "CPT",
+            "code": "29870",
+            "included_in": "29888",
+            "joint": "knee",
+            "source": "CMS NCCI Policy Manual Chapter IV, Section E.1",
+        }
+    ]
+
+
 def test_jev_primary_receives_icd_injury_and_initial_encounter_guidance(
     session, tmp_path: Path
 ) -> None:  # type: ignore[no-untyped-def]

@@ -805,6 +805,7 @@ class ChartProcessor:
         ]
         questions: dict[str, dict[str, Any]] = {}
         metadata: dict[str, dict[str, Any]] = {}
+        choice_metadata: dict[str, dict[str, Any]] = {}
         coding_facts: dict[str, dict[str, Any]] = {}
         candidate_decisions: dict[str, dict[str, Any]] = {}
         question_state_refs: dict[str, dict[str, str]] = {}
@@ -894,6 +895,36 @@ class ChartProcessor:
                     "candidate": candidate,
                     "candidate_count": len(scoped),
                 }
+            choice_key = decision_key(fact.fact_type, "code_ranking", fact.id)
+            choice_options: dict[str, str] = {}
+            option_candidates: dict[str, CandidateCode] = {}
+            for option_index, candidate in enumerate(scoped):
+                option = f"candidate_{option_index}"
+                guidance = _candidate_coding_guidance(candidate)
+                choice_options[option] = (
+                    f"{candidate.code_system} {candidate.code}: "
+                    f"{candidate.description or 'no description'}.{guidance}"
+                )
+                option_candidates[option] = candidate
+            choice_options["none"] = (
+                "None of the candidates exactly matches the documented active diagnosis or "
+                "performed service."
+            )
+            questions[choice_key] = {
+                "type": "choice",
+                "instructions": (
+                    f"Which candidate best matches the documented {fact.fact_type} fact "
+                    f"'{fact.normalized_value or fact.value}' using "
+                    f"`coding_facts.{fact_ref}.evidence`? Choose none when no candidate is an "
+                    "exact match."
+                ),
+                "criteria": choice_options,
+            }
+            question_state_refs[choice_key] = {"fact": fact_ref}
+            choice_metadata[choice_key] = {
+                "fact": fact,
+                "options": option_candidates,
+            }
         selection_state = {
             "service_date": chart.service_date.isoformat(),
             "setting": chart.setting,
@@ -911,7 +942,7 @@ class ChartProcessor:
                 "candidates": sum(len(items) for items in fact_candidates.values()),
                 "questions": len(questions),
             },
-            batch_size=20,
+            batch_size=21,
             question_state_refs=question_state_refs,
         )
         if selection_output.get("status") != "complete":
@@ -936,8 +967,37 @@ class ChartProcessor:
             }
 
         selections: list[dict[str, Any]] = []
+        code_rankings: list[dict[str, Any]] = []
+        choice_winners: dict[tuple[str, str], float] = {}
         proposed: dict[tuple[str, str], dict[str, Any]] = {}
         answers = selection_output.get("answers", {})
+        for key, details in choice_metadata.items():
+            parsed = parse_choice(answers.get(key), {*details["options"], "none"})
+            bucket = decision_bucket(
+                parsed.probability,
+                self.settings.jev_accept_threshold,
+                self.settings.jev_review_threshold,
+            )
+            candidate = details["options"].get(parsed.value)
+            accepted = bool(parsed.valid and bucket == "accepted" and candidate is not None)
+            if accepted:
+                choice_winners[(details["fact"].id, candidate.id)] = float(parsed.probability)
+            code_rankings.append(
+                {
+                    "question": key,
+                    "fact_id": details["fact"].id,
+                    "fact_type": details["fact"].fact_type,
+                    "fact": details["fact"].normalized_value or details["fact"].value,
+                    "choice": parsed.value,
+                    "code_system": candidate.code_system if candidate is not None else None,
+                    "code": candidate.code if candidate is not None else None,
+                    "probability": parsed.probability,
+                    "status": bucket,
+                    "selected": accepted,
+                    "abstained": not parsed.valid,
+                    "error": parsed.error,
+                }
+            )
         for key, details in metadata.items():
             fact = details["fact"]
             candidate = details["candidate"]
@@ -945,11 +1005,18 @@ class ChartProcessor:
             bucket, supported = _noul_status(
                 parsed.probability, self.settings.jev_accept_threshold
             )
+            choice_probability = choice_winners.get((fact.id, candidate.id))
+            choice_selected = bool(
+                choice_probability is not None
+                and parsed.valid
+                and parsed.probability is not None
+                and parsed.probability > 1 - self.settings.jev_accept_threshold
+            )
             selected = bool(
                 parsed.valid
                 and bucket == "accepted"
                 and supported
-            )
+            ) or choice_selected
             if parsed.error:
                 warnings.append(
                     {
@@ -970,9 +1037,15 @@ class ChartProcessor:
                 "code": candidate.code,
                 "description": candidate.description,
                 "probability": parsed.probability,
+                "choice_probability": choice_probability,
                 "status": bucket,
                 "supported": supported,
                 "selected": selected,
+                "selection_basis": (
+                    "candidate_noul" if supported and bucket == "accepted" else "fact_choice"
+                    if choice_selected
+                    else None
+                ),
                 "abstained": not parsed.valid,
                 "error": parsed.error,
                 "evidence_span_ids": fact.evidence_span_ids,
@@ -980,19 +1053,26 @@ class ChartProcessor:
             selections.append(decision)
             if not selected:
                 continue
+            selection_probability = max(
+                value
+                for value in (parsed.probability, choice_probability)
+                if value is not None
+            )
             code_key = (candidate.code_system, canonical_code(candidate.code))
             existing = proposed.get(code_key)
             if existing is None:
                 proposed[code_key] = {
                     "candidate": candidate,
                     "facts": [fact],
-                    "probability": parsed.probability,
+                    "probability": selection_probability,
                     "evidence_span_ids": list(fact.evidence_span_ids),
                     "candidate_count": details["candidate_count"],
                 }
             else:
                 existing["facts"].append(fact)
-                existing["probability"] = min(existing["probability"], parsed.probability)
+                existing["probability"] = min(
+                    existing["probability"], selection_probability
+                )
                 existing["evidence_span_ids"] = sorted(
                     set(existing["evidence_span_ids"]) | set(fact.evidence_span_ids)
                 )
@@ -1001,6 +1081,31 @@ class ChartProcessor:
                 )
 
         proposed_lines = list(proposed.values())
+        deterministic_exclusions = _included_diagnostic_arthroscopy_exclusions(
+            proposed_lines
+        )
+        if deterministic_exclusions:
+            excluded_keys = {
+                (item["code_system"], canonical_code(item["code"]))
+                for item in deterministic_exclusions
+            }
+            proposed_lines = [
+                item
+                for item in proposed_lines
+                if (
+                    item["candidate"].code_system,
+                    canonical_code(item["candidate"].code),
+                )
+                not in excluded_keys
+            ]
+            for selection in selections:
+                selection_key = (
+                    selection.get("code_system"),
+                    canonical_code(selection.get("code")),
+                )
+                if selection.get("selected") and selection_key in excluded_keys:
+                    selection["selected"] = False
+                    selection["exclusion"] = "included_diagnostic_arthroscopy"
         if any(item.get("status") == "review" for item in selections):
             warnings.append(
                 {
@@ -1134,10 +1239,12 @@ class ChartProcessor:
             "status": "complete",
             "model": model,
             "facts": fact_trace.get("decisions", []),
+            "code_rankings": code_rankings,
             "code_selections": selections,
             "modifier_decisions": modifier_decisions,
             "diagnosis_links": diagnosis_links,
             "rule_exception_decisions": [],
+            "deterministic_exclusions": deterministic_exclusions,
             "retrieval_warnings": [
                 item for item in warnings if item.get("code") == "NO_CANDIDATES_FOR_FACT"
             ],
@@ -1442,9 +1549,10 @@ class ChartProcessor:
                 if key in question_state_refs
             }
             candidate_refs = {
-                question_state_refs[key]["candidate"]
+                candidate_ref
                 for key in question_keys
                 if key in question_state_refs
+                and (candidate_ref := question_state_refs[key].get("candidate"))
             }
             return {
                 **{
@@ -1981,8 +2089,9 @@ _ORTHOPEDIC_RETRIEVAL_ALIASES = (
 
 _ORTHOPEDIC_CPT_CODING_GUIDANCE = {
     "64721": (
-        "In CPT terminology, a documented open carpal tunnel release is represented by "
-        "neuroplasty and/or transposition of the median nerve at the carpal tunnel (64721)."
+        "In CPT terminology, a documented open carpal tunnel release or open decompression "
+        "of the median nerve at the carpal tunnel is represented by neuroplasty and/or "
+        "transposition of that nerve (64721)."
     ),
     "64718": (
         "In CPT terminology, an open cubital tunnel release or ulnar nerve decompression "
@@ -2100,6 +2209,79 @@ def _candidate_coding_guidance(candidate: CandidateCode) -> str:
             "represented in the corresponding ligament sprain category."
         )
     return f" Coding guidance: {' '.join(guidance)}" if guidance else ""
+
+
+def _included_diagnostic_arthroscopy_exclusions(
+    proposed_lines: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply the CMS rule that surgical arthroscopy includes diagnostic arthroscopy."""
+
+    joints = ("shoulder", "elbow", "wrist", "hip", "knee", "ankle")
+
+    def line_text(item: dict[str, Any]) -> str:
+        candidate = item["candidate"]
+        facts = item.get("facts", [])
+        return " ".join(
+            [
+                candidate.description or "",
+                *(f"{fact.value} {fact.normalized_value or ''}" for fact in facts),
+            ]
+        ).lower()
+
+    def lateralities(value: str) -> set[str]:
+        result: set[str] = set()
+        if "bilateral" in value:
+            result.update({"left", "right"})
+        if re.search(r"\b(left|lt)\b", value):
+            result.add("left")
+        if re.search(r"\b(right|rt)\b", value):
+            result.add("right")
+        return result
+
+    exclusions: list[dict[str, Any]] = []
+    for diagnostic in proposed_lines:
+        candidate = diagnostic["candidate"]
+        if candidate.code_system != "CPT":
+            continue
+        diagnostic_text = line_text(diagnostic)
+        if "arthroscop" not in diagnostic_text or "diagnostic" not in diagnostic_text:
+            continue
+        joint = next((value for value in joints if value in diagnostic_text), None)
+        if joint is None:
+            continue
+        diagnostic_lateralities = lateralities(diagnostic_text)
+        for therapeutic in proposed_lines:
+            if therapeutic is diagnostic:
+                continue
+            therapeutic_candidate = therapeutic["candidate"]
+            if therapeutic_candidate.code_system != "CPT":
+                continue
+            therapeutic_text = line_text(therapeutic)
+            if (
+                "arthroscop" not in therapeutic_text
+                or "diagnostic" in therapeutic_text
+                or joint not in therapeutic_text
+            ):
+                continue
+            therapeutic_lateralities = lateralities(therapeutic_text)
+            if (
+                diagnostic_lateralities
+                and therapeutic_lateralities
+                and not diagnostic_lateralities.issubset(therapeutic_lateralities)
+            ):
+                continue
+            exclusions.append(
+                {
+                    "rule": "included_diagnostic_arthroscopy",
+                    "code_system": candidate.code_system,
+                    "code": candidate.code,
+                    "included_in": therapeutic_candidate.code,
+                    "joint": joint,
+                    "source": "CMS NCCI Policy Manual Chapter IV, Section E.1",
+                }
+            )
+            break
+    return exclusions
 
 
 def _noul_status(probability: float | None, accept_threshold: float) -> tuple[str, bool]:
