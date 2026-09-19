@@ -1087,6 +1087,32 @@ class ChartProcessor:
                 )
 
         proposed_lines = list(proposed.values())
+        candidate_pool = list(
+            {
+                details["candidate"].id: details["candidate"]
+                for details in metadata.values()
+            }.values()
+        )
+        proposed_lines, deterministic_consolidations = _consolidate_bilateral_icd_proposals(
+            proposed_lines,
+            candidate_pool,
+        )
+        if deterministic_consolidations:
+            replaced_codes = {
+                code
+                for item in deterministic_consolidations
+                for code in item["replaced_codes"]
+            }
+            consolidated_to = {
+                code: item["code"]
+                for item in deterministic_consolidations
+                for code in item["replaced_codes"]
+            }
+            for selection in selections:
+                if selection.get("selected") and selection.get("code") in replaced_codes:
+                    selection["selected"] = False
+                    selection["exclusion"] = "bilateral_code_available"
+                    selection["consolidated_to"] = consolidated_to[selection["code"]]
         deterministic_exclusions = _included_diagnostic_arthroscopy_exclusions(
             proposed_lines
         )
@@ -1210,13 +1236,21 @@ class ChartProcessor:
             )
             fact = proposed_line["facts"][0]
             units = self._deterministic_units(candidate, fact, validated_facts)
-            rationale = (
-                f"{candidate.code_system} {candidate.code} selected by JEV from "
-                f"{proposed_line['candidate_count']} active candidate options. "
-                f"Selection probability: {float(proposed_line['probability']):.1%}. "
-                f"Supporting clinical fact: '{fact.normalized_value or fact.value}'. "
-                f"Evidence spans: {', '.join(proposed_line['evidence_span_ids'])}."
-            )
+            if proposed_line.get("selection_basis") == "bilateral_consolidation":
+                rationale = (
+                    f"{candidate.code_system} {candidate.code} is the active bilateral code "
+                    "for the JEV-supported right and left diagnosis facts. "
+                    f"Conservative confidence: {float(proposed_line['probability']):.1%}. "
+                    f"Evidence spans: {', '.join(proposed_line['evidence_span_ids'])}."
+                )
+            else:
+                rationale = (
+                    f"{candidate.code_system} {candidate.code} selected by JEV from "
+                    f"{proposed_line['candidate_count']} active candidate options. "
+                    f"Selection probability: {float(proposed_line['probability']):.1%}. "
+                    f"Supporting clinical fact: '{fact.normalized_value or fact.value}'. "
+                    f"Evidence spans: {', '.join(proposed_line['evidence_span_ids'])}."
+                )
             line_output.append(
                 {
                     "code_system": candidate.code_system,
@@ -1250,6 +1284,7 @@ class ChartProcessor:
             "modifier_decisions": modifier_decisions,
             "diagnosis_links": diagnosis_links,
             "rule_exception_decisions": [],
+            "deterministic_consolidations": deterministic_consolidations,
             "deterministic_exclusions": deterministic_exclusions,
             "retrieval_warnings": [
                 item for item in warnings if item.get("code") == "NO_CANDIDATES_FOR_FACT"
@@ -2276,6 +2311,126 @@ def _candidate_coding_guidance(candidate: CandidateCode) -> str:
             "represented in the corresponding ligament sprain category."
         )
     return f" Coding guidance: {' '.join(guidance)}" if guidance else ""
+
+
+def _consolidate_bilateral_icd_proposals(
+    proposed_lines: list[dict[str, Any]],
+    candidate_pool: list[CandidateCode],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Prefer one active bilateral ICD-10-CM code over separate right/left codes."""
+
+    def description_signature(value: str | None) -> tuple[str, ...]:
+        singular = {
+            "ankles": "ankle",
+            "arms": "arm",
+            "ears": "ear",
+            "eyes": "eye",
+            "feet": "foot",
+            "hands": "hand",
+            "hips": "hip",
+            "knees": "knee",
+            "limbs": "limb",
+            "shoulders": "shoulder",
+            "wrists": "wrist",
+        }
+        ignored = {"bilateral", "left", "right", "unilateral"}
+        return tuple(
+            singular.get(token, token)
+            for token in re.findall(r"[a-z0-9]+", (value or "").lower())
+            if token not in ignored
+        )
+
+    indexed_groups: dict[tuple[str, ...], list[tuple[int, dict[str, Any]]]] = {}
+    for index, item in enumerate(proposed_lines):
+        candidate = item["candidate"]
+        if candidate.code_system != "ICD10CM":
+            continue
+        signature = description_signature(candidate.description)
+        indexed_groups.setdefault(signature, []).append((index, item))
+
+    bilateral_by_signature = {
+        description_signature(candidate.description): candidate
+        for candidate in candidate_pool
+        if candidate.code_system == "ICD10CM"
+        and re.search(r"\bbilateral\b", candidate.description or "", re.I)
+    }
+    replacements: dict[int, dict[str, Any]] = {}
+    skipped_indexes: set[int] = set()
+    consolidations: list[dict[str, Any]] = []
+    for signature, indexed_rows in indexed_groups.items():
+        right = next(
+            (
+                (index, item)
+                for index, item in indexed_rows
+                if re.search(r"\bright\b", item["candidate"].description or "", re.I)
+            ),
+            None,
+        )
+        left = next(
+            (
+                (index, item)
+                for index, item in indexed_rows
+                if re.search(r"\bleft\b", item["candidate"].description or "", re.I)
+            ),
+            None,
+        )
+        bilateral = bilateral_by_signature.get(signature)
+        if right is None or left is None or bilateral is None:
+            continue
+        right_index, right_item = right
+        left_index, left_item = left
+        if canonical_code(bilateral.code) in {
+            canonical_code(right_item["candidate"].code),
+            canonical_code(left_item["candidate"].code),
+        }:
+            continue
+        facts = {
+            fact.id: fact
+            for item in (right_item, left_item)
+            for fact in item.get("facts", [])
+        }
+        evidence_span_ids = sorted(
+            set(right_item.get("evidence_span_ids", []))
+            | set(left_item.get("evidence_span_ids", []))
+        )
+        replacement_index = min(right_index, left_index)
+        replacements[replacement_index] = {
+            "candidate": bilateral,
+            "facts": list(facts.values()),
+            "probability": min(
+                float(right_item["probability"]),
+                float(left_item["probability"]),
+            ),
+            "evidence_span_ids": evidence_span_ids,
+            "candidate_count": max(
+                int(right_item["candidate_count"]),
+                int(left_item["candidate_count"]),
+            ),
+            "selection_basis": "bilateral_consolidation",
+        }
+        skipped_indexes.update({right_index, left_index})
+        consolidations.append(
+            {
+                "rule": "bilateral_code_available",
+                "code_system": "ICD10CM",
+                "code": bilateral.code,
+                "replaced_codes": [
+                    right_item["candidate"].code,
+                    left_item["candidate"].code,
+                ],
+                "source": "ICD-10-CM Official Guidelines I.B.13 Laterality",
+            }
+        )
+
+    if not replacements:
+        return proposed_lines, []
+    consolidated: list[dict[str, Any]] = []
+    for index, item in enumerate(proposed_lines):
+        if index in replacements:
+            consolidated.append(replacements[index])
+        if index not in skipped_indexes:
+            consolidated.append(item)
+    return consolidated, consolidations
 
 
 def _included_diagnostic_arthroscopy_exclusions(

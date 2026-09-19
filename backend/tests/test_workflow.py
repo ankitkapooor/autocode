@@ -1382,19 +1382,50 @@ def test_jev_primary_bilateral_context_uses_active_modifier_50(session, tmp_path
         session,
         settings,
         text=text,
-        codes=[{"code": "64721", "description": "open carpal tunnel release"}],
+        codes=[
+            {"code": "64721", "description": "open carpal tunnel release"},
+            {
+                "code_system": "ICD10CM",
+                "code": "G56.01",
+                "description": "Carpal tunnel syndrome, right upper limb",
+            },
+            {
+                "code_system": "ICD10CM",
+                "code": "G56.02",
+                "description": "Carpal tunnel syndrome, left upper limb",
+            },
+            {
+                "code_system": "ICD10CM",
+                "code": "G56.03",
+                "description": "Carpal tunnel syndrome, bilateral upper limbs",
+            },
+        ],
         modifiers=["50", "LT", "RT"],
     )
     provider = FakeProvider(
         facts=[
             {"fact_type": "procedure", "value": "bilateral open carpal tunnel release", "normalized_value": "open carpal tunnel release", "assertion": "present", "confidence": 0.98},
+            {"fact_type": "diagnosis", "value": "right carpal tunnel syndrome", "normalized_value": "right carpal tunnel syndrome", "assertion": "present", "confidence": 0.99},
+            {"fact_type": "diagnosis", "value": "left carpal tunnel syndrome", "normalized_value": "left carpal tunnel syndrome", "assertion": "present", "confidence": 0.99},
             {"fact_type": "laterality", "value": "right", "normalized_value": "right", "assertion": "present", "confidence": 0.99},
             {"fact_type": "laterality", "value": "left", "normalized_value": "left", "assertion": "present", "confidence": 0.99},
+        ],
+        search_queries=[
+            "open carpal tunnel release",
+            "right carpal tunnel syndrome",
+            "left carpal tunnel syndrome",
+            "bilateral carpal tunnel syndrome",
         ],
         selected_codes=["64721"],
         fail_on_select=True,
     )
-    jev = ScriptedJevProvider(code_by_fact={"carpal tunnel": "64721"})
+    jev = ScriptedJevProvider(
+        code_by_fact={
+            "open carpal tunnel release": "64721",
+            "right carpal tunnel syndrome": "G56.01",
+            "left carpal tunnel syndrome": "G56.02",
+        }
+    )
 
     report = ChartProcessor(
         session,
@@ -1406,7 +1437,19 @@ def test_jev_primary_bilateral_context_uses_active_modifier_50(session, tmp_path
 
     result = session.get(CodingResult, report["result_id"])
     assert result is not None
-    assert result.lines[0].modifiers == ["50"]
+    assert {line.code for line in result.lines} == {"64721", "G56.03"}
+    procedure = next(line for line in result.lines if line.code == "64721")
+    assert procedure.modifiers == ["50"]
+    assert procedure.diagnosis_pointers == ["G56.03"]
+    assert result.jev_output["deterministic_consolidations"] == [
+        {
+            "rule": "bilateral_code_available",
+            "code_system": "ICD10CM",
+            "code": "G56.03",
+            "replaced_codes": ["G56.01", "G56.02"],
+            "source": "ICD-10-CM Official Guidelines I.B.13 Laterality",
+        }
+    ]
 
 
 def test_jev_primary_failure_preserves_facts_and_candidates_without_fallback(session, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
