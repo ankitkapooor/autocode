@@ -131,6 +131,7 @@ class ScriptedJevProvider:
         candidate_probability: float | None = None,
         choice_probability: float | None = None,
         modifier_probability: float | None = None,
+        diagnosis_link_probability: float | None = None,
     ):
         self.fact_classes = fact_classes or {}
         self.code_by_fact = code_by_fact or {}
@@ -139,6 +140,7 @@ class ScriptedJevProvider:
         self.candidate_probability = candidate_probability
         self.choice_probability = choice_probability
         self.modifier_probability = modifier_probability
+        self.diagnosis_link_probability = diagnosis_link_probability
         self.calls: list[set[str]] = []
         self.question_batches: list[dict[str, dict]] = []
         self.states: list[dict] = []
@@ -236,6 +238,11 @@ class ScriptedJevProvider:
                     probability = 0.05
                 elif "modifier " in instructions and self.modifier_probability is not None:
                     probability = self.modifier_probability
+                elif (
+                    "does documented diagnosis" in instructions
+                    and self.diagnosis_link_probability is not None
+                ):
+                    probability = self.diagnosis_link_probability
                 elif "ncci pair" in instructions and "separate incision" not in evidence:
                     probability = 0.05
                 answers[key] = {"type": "noul", "noul": probability}
@@ -1676,7 +1683,8 @@ def test_diagnosis_pointers_come_from_jev_relationship_decisions(session, tmp_pa
         fail_on_select=True,
     )
     jev = ScriptedJevProvider(
-        code_by_fact={"repair": "29827", "tear": "M75.121"}
+        code_by_fact={"repair": "29827", "tear": "M75.121"},
+        diagnosis_link_probability=0.65,
     )
 
     report = ChartProcessor(
@@ -1692,6 +1700,8 @@ def test_diagnosis_pointers_come_from_jev_relationship_decisions(session, tmp_pa
     procedure = next(line for line in result.lines if line.code == "29827")
     assert procedure.diagnosis_pointers == ["M75.121"]
     assert result.jev_output["diagnosis_links"][0]["linked"] is True
+    assert result.jev_output["diagnosis_links"][0]["status"] == "review"
+    assert result.jev_output["diagnosis_links"][0]["link_basis"] == "fact_jev_consensus"
     link_batch_index = next(
         index
         for index, batch in enumerate(jev.question_batches)

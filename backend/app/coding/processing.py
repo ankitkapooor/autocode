@@ -1505,6 +1505,12 @@ class ChartProcessor:
             bucket, supported = _noul_status(
                 parsed.probability, self.settings.jev_accept_threshold
             )
+            corroborated = bool(
+                parsed.valid
+                and supported
+                and parsed.probability is not None
+                and parsed.probability >= self.settings.jev_review_threshold
+            )
             decisions.append(
                 {
                     **details,
@@ -1512,7 +1518,12 @@ class ChartProcessor:
                     "probability": parsed.probability,
                     "status": bucket,
                     "supported": supported,
-                    "linked": parsed.valid and bucket == "accepted" and supported,
+                    "linked": corroborated,
+                    "link_basis": (
+                        "candidate_noul" if bucket == "accepted" else "fact_jev_consensus"
+                    )
+                    if corroborated
+                    else None,
                     "error": parsed.error,
                 }
             )
