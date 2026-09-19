@@ -671,7 +671,7 @@ def test_jev_primary_excludes_diagnostic_arthroscopy_included_in_surgical_scope(
             {
                 "fact_type": "procedure",
                 "value": "arthroscopic left ACL reconstruction",
-                "normalized_value": "arthroscopic ACL reconstruction left knee",
+                "normalized_value": "arthroscopically aided ACL reconstruction",
                 "assertion": "present",
                 "confidence": 0.99,
             },

@@ -2294,6 +2294,43 @@ def _included_diagnostic_arthroscopy_exclusions(
             result.add("right")
         return result
 
+    def arthroscopy_joint(item: dict[str, Any], value: str) -> str | None:
+        direct = next((joint for joint in joints if joint in value), None)
+        if direct is not None:
+            return direct
+        candidate = item["candidate"]
+        code = canonical_code(candidate.code)
+        diagnostic_codes = {
+            "29805": "shoulder",
+            "29830": "elbow",
+            "29840": "wrist",
+            "29860": "hip",
+            "29870": "knee",
+            "29894": "ankle",
+        }
+        if code in diagnostic_codes:
+            return diagnostic_codes[code]
+        if not code.isdigit():
+            return None
+        numeric = int(code)
+        arthroscopy_ranges = (
+            (29806, 29828, "shoulder"),
+            (29831, 29838, "elbow"),
+            (29843, 29847, "wrist"),
+            (29861, 29863, "hip"),
+            (29866, 29889, "knee"),
+            (29895, 29899, "ankle"),
+            (29914, 29916, "hip"),
+        )
+        return next(
+            (
+                joint
+                for start, end, joint in arthroscopy_ranges
+                if start <= numeric <= end
+            ),
+            None,
+        )
+
     exclusions: list[dict[str, Any]] = []
     for diagnostic in proposed_lines:
         candidate = diagnostic["candidate"]
@@ -2302,7 +2339,7 @@ def _included_diagnostic_arthroscopy_exclusions(
         diagnostic_text = line_text(diagnostic)
         if "arthroscop" not in diagnostic_text or "diagnostic" not in diagnostic_text:
             continue
-        joint = next((value for value in joints if value in diagnostic_text), None)
+        joint = arthroscopy_joint(diagnostic, diagnostic_text)
         if joint is None:
             continue
         diagnostic_lateralities = lateralities(diagnostic_text)
@@ -2313,10 +2350,11 @@ def _included_diagnostic_arthroscopy_exclusions(
             if therapeutic_candidate.code_system != "CPT":
                 continue
             therapeutic_text = line_text(therapeutic)
+            therapeutic_joint = arthroscopy_joint(therapeutic, therapeutic_text)
             if (
                 "arthroscop" not in therapeutic_text
                 or "diagnostic" in therapeutic_text
-                or joint not in therapeutic_text
+                or therapeutic_joint != joint
             ):
                 continue
             therapeutic_lateralities = lateralities(therapeutic_text)
