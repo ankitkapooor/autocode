@@ -130,6 +130,7 @@ class ScriptedJevProvider:
         unavailable: bool = False,
         candidate_probability: float | None = None,
         choice_probability: float | None = None,
+        modifier_probability: float | None = None,
     ):
         self.fact_classes = fact_classes or {}
         self.code_by_fact = code_by_fact or {}
@@ -137,6 +138,7 @@ class ScriptedJevProvider:
         self.unavailable = unavailable
         self.candidate_probability = candidate_probability
         self.choice_probability = choice_probability
+        self.modifier_probability = modifier_probability
         self.calls: list[set[str]] = []
         self.question_batches: list[dict[str, dict]] = []
         self.states: list[dict] = []
@@ -232,6 +234,8 @@ class ScriptedJevProvider:
                     probability = 0.05
                 elif "modifier 51" in instructions or "modifier 80" in instructions:
                     probability = 0.05
+                elif "modifier " in instructions and self.modifier_probability is not None:
+                    probability = self.modifier_probability
                 elif "ncci pair" in instructions and "separate incision" not in evidence:
                     probability = 0.05
                 answers[key] = {"type": "noul", "noul": probability}
@@ -1342,7 +1346,10 @@ def test_jev_primary_left_laterality_is_evidence_backed_without_rt(session, tmp_
         selected_codes=["29881"],
         fail_on_select=True,
     )
-    jev = ScriptedJevProvider(code_by_fact={"meniscectomy": "29881"})
+    jev = ScriptedJevProvider(
+        code_by_fact={"meniscectomy": "29881"},
+        modifier_probability=0.65,
+    )
 
     report = ChartProcessor(
         session,
@@ -1360,6 +1367,8 @@ def test_jev_primary_left_laterality_is_evidence_backed_without_rt(session, tmp_
         item for item in result.jev_output["modifier_decisions"] if item["modifier"] == "LT"
     )
     assert lt_decision["applied"] is True
+    assert lt_decision["status"] == "review"
+    assert lt_decision["application_basis"] == "fact_jev_consensus"
     assert result.lines[0].evidence_span_ids
 
 
