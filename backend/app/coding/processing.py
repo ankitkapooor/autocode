@@ -980,7 +980,13 @@ class ChartProcessor:
             )
             candidate = details["options"].get(parsed.value)
             accepted = bool(parsed.valid and bucket == "accepted" and candidate is not None)
-            if accepted:
+            supports_consensus = bool(
+                parsed.valid
+                and candidate is not None
+                and parsed.probability is not None
+                and parsed.probability >= self.settings.jev_review_threshold
+            )
+            if supports_consensus:
                 choice_winners[(details["fact"].id, candidate.id)] = float(parsed.probability)
             code_rankings.append(
                 {
@@ -1010,7 +1016,7 @@ class ChartProcessor:
                 choice_probability is not None
                 and parsed.valid
                 and parsed.probability is not None
-                and parsed.probability > 1 - self.settings.jev_accept_threshold
+                and parsed.probability >= self.settings.jev_review_threshold
             )
             selected = bool(
                 parsed.valid
@@ -1042,7 +1048,7 @@ class ChartProcessor:
                 "supported": supported,
                 "selected": selected,
                 "selection_basis": (
-                    "candidate_noul" if supported and bucket == "accepted" else "fact_choice"
+                    "candidate_noul" if supported and bucket == "accepted" else "jev_consensus"
                     if choice_selected
                     else None
                 ),

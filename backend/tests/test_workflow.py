@@ -128,11 +128,15 @@ class ScriptedJevProvider:
         code_by_fact: dict[str, str] | None = None,
         abstain_for: set[str] | None = None,
         unavailable: bool = False,
+        candidate_probability: float | None = None,
+        choice_probability: float | None = None,
     ):
         self.fact_classes = fact_classes or {}
         self.code_by_fact = code_by_fact or {}
         self.abstain_for = abstain_for or set()
         self.unavailable = unavailable
+        self.candidate_probability = candidate_probability
+        self.choice_probability = choice_probability
         self.calls: list[set[str]] = []
         self.question_batches: list[dict[str, dict]] = []
         self.states: list[dict] = []
@@ -186,10 +190,15 @@ class ScriptedJevProvider:
                             ),
                             next(option for option in criteria if option.startswith("candidate_")),
                         )
+                answer_probability = (
+                    self.choice_probability
+                    if not key.startswith("fact_") and self.choice_probability is not None
+                    else 0.96
+                )
                 answers[key] = {
                     "type": "choice",
                     "choice": choice,
-                    "probabilities": {choice: 0.96},
+                    "probabilities": {choice: answer_probability},
                 }
             else:
                 instructions = question["instructions"].lower()
@@ -206,7 +215,11 @@ class ScriptedJevProvider:
                     if any(phrase.lower() in instructions for phrase in self.abstain_for):
                         probability = 0.5
                     elif target and f" {target.lower()} (" in instructions:
-                        probability = 0.96
+                        probability = (
+                            self.candidate_probability
+                            if self.candidate_probability is not None
+                            else 0.96
+                        )
                     else:
                         probability = 0.05
                 elif "modifier rt" in instructions and "right" not in evidence:
@@ -694,6 +707,59 @@ def test_jev_primary_excludes_diagnostic_arthroscopy_included_in_surgical_scope(
             "source": "CMS NCCI Policy Manual Chapter IV, Section E.1",
         }
     ]
+
+
+def test_jev_primary_keeps_dual_review_band_consensus_as_review_required_line(
+    session, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    text = "An open right carpal tunnel release was performed."
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text=text,
+        codes=[
+            {
+                "code": "64721",
+                "description": "Neuroplasty and/or transposition; median nerve at carpal tunnel",
+            }
+        ],
+    )
+    provider = FakeProvider(
+        facts=[
+            {
+                "fact_type": "procedure",
+                "value": "open right carpal tunnel release",
+                "normalized_value": "open right carpal tunnel release",
+                "assertion": "present",
+                "confidence": 0.99,
+            }
+        ],
+        fail_on_select=True,
+    )
+    jev = ScriptedJevProvider(
+        code_by_fact={"carpal tunnel": "64721"},
+        candidate_probability=0.55,
+        choice_probability=0.65,
+    )
+
+    report = ChartProcessor(
+        session,
+        settings,
+        provider=provider,
+        jev_provider=jev,
+        document_extractor=FakeDocumentExtractor(text),
+    ).process(chart.id)
+
+    result = session.get(CodingResult, report["result_id"])
+    assert result is not None
+    assert [line.code for line in result.lines] == ["64721"]
+    assert result.lines[0].confidence == 0.65
+    assert result.confidence_state == "YELLOW"
+    selection = next(
+        item for item in result.jev_output["code_selections"] if item["code"] == "64721"
+    )
+    assert selection["selection_basis"] == "jev_consensus"
 
 
 def test_jev_primary_receives_icd_injury_and_initial_encounter_guidance(
