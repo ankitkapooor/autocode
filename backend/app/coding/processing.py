@@ -805,8 +805,26 @@ class ChartProcessor:
         ]
         questions: dict[str, dict[str, Any]] = {}
         metadata: dict[str, dict[str, Any]] = {}
+        coding_facts: dict[str, dict[str, Any]] = {}
+        candidate_decisions: dict[str, dict[str, Any]] = {}
+        question_state_refs: dict[str, dict[str, str]] = {}
+        span_text = {span.id: span.text[:4000] for span in spans}
         warnings: list[dict[str, Any]] = []
         for fact in codable_facts:
+            fact_ref = f"fact_{fact.id.replace('-', '_')}"
+            coding_facts[fact_ref] = {
+                "fact_type": fact.fact_type,
+                "clinical_fact": fact.normalized_value or fact.value,
+                "assertion": fact.assertion,
+                "evidence": [
+                    {
+                        "evidence_span_id": evidence_id,
+                        "text": span_text[evidence_id],
+                    }
+                    for evidence_id in fact.evidence_span_ids
+                    if evidence_id in span_text
+                ],
+            }
             scoped = fact_candidates.get(fact.id, [])[:20]
             if not scoped:
                 warnings.append(
@@ -832,32 +850,57 @@ class ChartProcessor:
                     candidate.code_system,
                     canonical_code(candidate.code),
                 )
+                decision_ref = f"decision_{len(metadata)}"
+                candidate_decisions[decision_ref] = {
+                    "candidate": {
+                        "code_system": candidate.code_system,
+                        "code": candidate.code,
+                        "description": candidate.description,
+                    },
+                    "coding_guidance": coding_guidance.removeprefix(" Coding guidance: ")
+                    or "Use the candidate's official description.",
+                }
                 questions[key] = {
                     "type": "noul",
                     "instructions": (
-                        f"Does the cited source evidence for the {fact.fact_type} fact "
-                        f"'{fact.normalized_value or fact.value}' directly support separately "
-                        f"reporting active billable {candidate.code_system} {candidate.code} "
-                        f"({candidate.description or 'no description'}) for this encounter?"
+                        f"Does the documented {fact.fact_type} fact "
+                        f"'{fact.normalized_value or fact.value}' correspond to "
+                        f"{candidate.code_system} {candidate.code} "
+                        f"({candidate.description or 'no description'})? Judge only this one "
+                        f"candidate using `coding_facts.{fact_ref}.evidence`, "
+                        f"`candidate_decisions.{decision_ref}.candidate`, and "
+                        f"`candidate_decisions.{decision_ref}.coding_guidance`."
                         f"{coding_guidance}"
                     ),
                     "criteria": {
                         "true": (
-                            "This exact candidate is directly supported, sufficiently specific, "
-                            "billable, and separately reportable for the documented encounter."
+                            "The documented active diagnosis or performed service matches this "
+                            "exact candidate, including anatomy, approach, laterality, and "
+                            "encounter specificity when those distinctions apply."
                         ),
                         "false": (
-                            "The candidate is unsupported, less specific than the documentation, "
-                            "bundled, excluded, historical, planned-only, or uncertain."
+                            "The candidate describes a different diagnosis, anatomy, approach, "
+                            "laterality, encounter type, or procedure, or the evidence is "
+                            "uncertain."
                         ),
                     },
+                }
+                question_state_refs[key] = {
+                    "fact": fact_ref,
+                    "candidate": decision_ref,
                 }
                 metadata[key] = {
                     "fact": fact,
                     "candidate": candidate,
                     "candidate_count": len(scoped),
                 }
-        selection_state = self._jev_state(chart, validated_facts, spans)
+        selection_state = {
+            "service_date": chart.service_date.isoformat(),
+            "setting": chart.setting,
+            "deidentified": chart.deidentified,
+            "coding_facts": coding_facts,
+            "candidate_decisions": candidate_decisions,
+        }
         selection_output = self._run_jev_decision_batches(
             chart,
             "jev_code_selection",
@@ -868,6 +911,8 @@ class ChartProcessor:
                 "candidates": sum(len(items) for items in fact_candidates.values()),
                 "questions": len(questions),
             },
+            batch_size=20,
+            question_state_refs=question_state_refs,
         )
         if selection_output.get("status") != "complete":
             jev_output = _unavailable_jev_graph(
@@ -881,7 +926,8 @@ class ChartProcessor:
                 item for item in warnings if item.get("code") == "NO_CANDIDATES_FOR_FACT"
             ]
             return jev_output, {
-                "summary": extraction_summary or "Clinical facts and candidates were preserved for review.",
+                "summary": extraction_summary
+                or "Clinical facts and candidates were preserved for review.",
                 "lines": [],
                 "pipeline_warnings": [
                     *warnings,
@@ -1385,10 +1431,46 @@ class ChartProcessor:
         input_summary: dict[str, Any],
         *,
         batch_size: int = 40,
+        question_state_refs: dict[str, dict[str, str]] | None = None,
     ) -> dict[str, Any]:
+        def state_for(question_keys: list[str]) -> dict[str, Any]:
+            if not question_state_refs:
+                return state
+            fact_refs = {
+                question_state_refs[key]["fact"]
+                for key in question_keys
+                if key in question_state_refs
+            }
+            candidate_refs = {
+                question_state_refs[key]["candidate"]
+                for key in question_keys
+                if key in question_state_refs
+            }
+            return {
+                **{
+                    key: value
+                    for key, value in state.items()
+                    if key not in {"coding_facts", "candidate_decisions"}
+                },
+                "coding_facts": {
+                    key: value
+                    for key, value in state.get("coding_facts", {}).items()
+                    if key in fact_refs
+                },
+                "candidate_decisions": {
+                    key: value
+                    for key, value in state.get("candidate_decisions", {}).items()
+                    if key in candidate_refs
+                },
+            }
+
         if len(questions) <= batch_size:
             return self._run_jev_decisions(
-                chart, stage, state, questions, input_summary
+                chart,
+                stage,
+                state_for(list(questions)),
+                questions,
+                input_summary,
             )
         question_items = list(questions.items())
         batch_count = math.ceil(len(question_items) / batch_size)
@@ -1401,7 +1483,7 @@ class ChartProcessor:
             last_output = self._run_jev_decisions(
                 chart,
                 stage,
-                state,
+                state_for(list(batch_questions)),
                 batch_questions,
                 {
                     **input_summary,
@@ -1897,6 +1979,28 @@ _ORTHOPEDIC_RETRIEVAL_ALIASES = (
     ),
 )
 
+_ORTHOPEDIC_CPT_CODING_GUIDANCE = {
+    "64721": (
+        "In CPT terminology, a documented open carpal tunnel release is represented by "
+        "neuroplasty and/or transposition of the median nerve at the carpal tunnel (64721)."
+    ),
+    "64718": (
+        "In CPT terminology, an open cubital tunnel release or ulnar nerve decompression "
+        "at the elbow is represented by ulnar nerve neuroplasty/transposition (64718)."
+    ),
+    "26055": (
+        "In CPT terminology, an open trigger-finger or A1-pulley release is represented by "
+        "incision of the tendon sheath (26055)."
+    ),
+    "29888": (
+        "CPT 29888 expressly includes arthroscopically aided anterior cruciate ligament "
+        "repair, augmentation, or reconstruction."
+    ),
+    "29827": "CPT 29827 represents arthroscopic surgical rotator-cuff repair.",
+    "27130": "CPT 27130 represents total hip arthroplasty/replacement.",
+    "27447": "CPT 27447 represents total knee arthroplasty/replacement.",
+}
+
 
 def _retrieval_tokens(value: str) -> set[str]:
     aliases = {"arthroscopic": "arthroscopy", "osteoarthritic": "osteoarthritis"}
@@ -1977,6 +2081,9 @@ def _candidate_systems_for_fact(fact: ClinicalFact) -> tuple[str, ...]:
 
 
 def _candidate_coding_guidance(candidate: CandidateCode) -> str:
+    if candidate.code_system == "CPT":
+        guidance = _ORTHOPEDIC_CPT_CODING_GUIDANCE.get(canonical_code(candidate.code))
+        return f" Coding guidance: {guidance}" if guidance else ""
     if candidate.code_system != "ICD10CM":
         return ""
     code_key = canonical_code(candidate.code)

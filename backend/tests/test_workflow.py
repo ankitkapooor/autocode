@@ -135,10 +135,12 @@ class ScriptedJevProvider:
         self.unavailable = unavailable
         self.calls: list[set[str]] = []
         self.question_batches: list[dict[str, dict]] = []
+        self.states: list[dict] = []
 
     def decide(self, state, questions):  # type: ignore[no-untyped-def]
         self.calls.append(set(questions))
         self.question_batches.append(questions)
+        self.states.append(state)
         if self.unavailable:
             return {
                 "provider": self.name,
@@ -607,6 +609,15 @@ def test_jev_primary_bridges_open_carpal_tunnel_to_cpt_descriptor(
     assert [line.code for line in result.lines] == ["64721"]
     candidate = session.query(CandidateCode).filter_by(code="64721").one()
     assert "median nerve" in candidate.description.lower()
+    question = next(
+        question
+        for batch in jev.question_batches
+        for key, question in batch.items()
+        if "_candidate_" in key and "CPT 64721" in question["instructions"]
+    )
+    assert "open carpal tunnel release" in question["instructions"]
+    assert "`coding_facts.fact_" in question["instructions"]
+    assert "`candidate_decisions.decision_" in question["instructions"]
 
 
 def test_jev_primary_receives_icd_injury_and_initial_encounter_guidance(
@@ -711,6 +722,58 @@ def test_jev_candidate_decisions_are_sent_in_bounded_batches(
     assert output["status"] == "complete"
     assert len(output["answers"]) == 81
     assert [len(batch) for batch in jev.question_batches] == [40, 40, 1]
+
+
+def test_jev_candidate_batches_only_receive_referenced_fact_state(
+    session, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    settings = _settings(tmp_path, "jev_primary")
+    chart, _, _ = _seed_chart(
+        session,
+        settings,
+        text="Synthetic scoped-state fixture with enough embedded text for processing.",
+        codes=[{"code": "29827", "description": "rotator cuff repair"}],
+    )
+    jev = ScriptedJevProvider()
+    processor = ChartProcessor(session, settings, jev_provider=jev)
+    questions = {
+        f"candidate_{index}": {
+            "type": "noul",
+            "instructions": f"Is synthetic candidate {index} supported?",
+            "criteria": {"true": "Supported", "false": "Unsupported"},
+        }
+        for index in range(3)
+    }
+    state = {
+        "deidentified": True,
+        "coding_facts": {"fact_a": {"evidence": ["A"]}, "fact_b": {"evidence": ["B"]}},
+        "candidate_decisions": {
+            "decision_0": {"code": "0"},
+            "decision_1": {"code": "1"},
+            "decision_2": {"code": "2"},
+        },
+    }
+    refs = {
+        "candidate_0": {"fact": "fact_a", "candidate": "decision_0"},
+        "candidate_1": {"fact": "fact_a", "candidate": "decision_1"},
+        "candidate_2": {"fact": "fact_b", "candidate": "decision_2"},
+    }
+
+    output = processor._run_jev_decision_batches(
+        chart,
+        "jev_code_selection",
+        state,
+        questions,
+        {"questions": len(questions)},
+        batch_size=2,
+        question_state_refs=refs,
+    )
+
+    assert output["status"] == "complete"
+    assert list(jev.states[0]["coding_facts"]) == ["fact_a"]
+    assert list(jev.states[0]["candidate_decisions"]) == ["decision_0", "decision_1"]
+    assert list(jev.states[1]["coding_facts"]) == ["fact_b"]
+    assert list(jev.states[1]["candidate_decisions"]) == ["decision_2"]
 
 
 def test_jev_primary_retrieves_total_hip_and_diagnosis_from_independent_fact_pools(
