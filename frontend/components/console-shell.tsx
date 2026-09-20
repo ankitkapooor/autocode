@@ -1,6 +1,6 @@
 "use client";
 
-import { BookOpen, ChartNoAxesCombined, Gauge, Home, Menu, RefreshCw, ShieldCheck, SlidersHorizontal, X } from "lucide-react";
+import { ArrowUpRight, BookOpen, ChartNoAxesCombined, Gauge, Globe2, Home, Menu, RefreshCw, ShieldCheck, SlidersHorizontal, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
@@ -42,4 +42,4 @@ function ConsoleBrand() { return <div className="flex h-[76px] items-center gap-
 
 function ConsoleNavigation({ pathname }: { pathname: string }) { return <nav className="flex-1 overflow-y-auto px-3 py-5" aria-label="Console navigation">{groups.map((group, groupIndex) => <div key={group.label} className={groupIndex ? "mt-7 border-t border-white/10 pt-6" : ""}><div className="mb-2 px-3 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-400">{group.label}</div><div className="space-y-1">{group.items.map((item) => { const active = item.exact ? pathname === item.href : pathname.startsWith(item.href); return <Link key={item.href} href={item.href} className={`flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition ${active ? "bg-white/12 text-white" : "text-slate-300 hover:bg-white/5 hover:text-white"}`}><item.icon size={17} /><span>{item.label}</span>{active && <span className="ml-auto h-1.5 w-1.5 rounded-full bg-cyan-300" />}</Link>; })}</div></div>)}</nav>; }
 
-function ConsoleGuard() { return <div className="border-t border-white/10 p-4"><div className="rounded-xl bg-white/5 p-3"><div className="flex items-center gap-2 text-xs font-semibold"><ShieldCheck size={15} className="text-cyan-300" />Human review required</div><p className="mt-2 text-[11px] leading-4 text-slate-300">Autonomy stays off until measured thresholds and provider controls pass.</p></div></div>; }
+function ConsoleGuard() { return <div className="border-t border-white/10 p-4"><Link href="/" className="mb-3 flex items-center gap-2 rounded-lg px-3 py-2.5 text-sm font-semibold text-slate-200 transition hover:bg-white/10 hover:text-white"><Globe2 size={16} /><span>Public website</span><ArrowUpRight size={14} className="ml-auto" /></Link><div className="rounded-xl bg-white/5 p-3"><div className="flex items-center gap-2 text-xs font-semibold"><ShieldCheck size={15} className="text-cyan-300" />Human review required</div><p className="mt-2 text-[11px] leading-4 text-slate-300">Autonomy stays off until measured thresholds and provider controls pass.</p></div></div>; }
