@@ -68,7 +68,7 @@ export default function LandingPage() {
               <h1 className="mt-7 max-w-4xl text-balance text-5xl font-semibold leading-[0.98] tracking-[-0.055em] text-white sm:text-6xl lg:text-[82px]">Every code traces back to a chart.</h1>
               <p className="mt-7 max-w-2xl text-pretty text-lg leading-8 text-slate-300 sm:text-xl">OrthoCode AI extracts clinical facts, makes bounded coding decisions, and enforces CMS requirements deterministically—so every proposed line has a defensible trail.</p>
               <div className="mt-9 flex flex-col items-start gap-4 sm:flex-row sm:items-center">
-                <Link className="marketing-primary" href="/request-access">Request access <ArrowRight size={17} /></Link>
+                <Link className="marketing-primary" href="/app">Open demo <ArrowRight size={17} /></Link>
                 <p className="flex items-center gap-2 text-sm text-slate-400"><Check size={16} className="text-cyan-300" /> In development · human review is mandatory</p>
               </div>
             </div>
@@ -109,7 +109,7 @@ export default function LandingPage() {
           <div className="mx-auto max-w-5xl"><div className="section-kicker">Questions, answered plainly</div><h2 className="marketing-h2 mt-5">What a careful coding team should ask.</h2><div className="mt-12 divide-y divide-line border-y border-line">{faqs.map(([question, answer]) => <details key={question} className="faq-row group"><summary><span>{question}</span><span className="faq-plus" /></summary><p>{answer}</p></details>)}</div></div>
         </section>
 
-        <section className="bg-warm px-5 py-20 text-ink sm:px-8 sm:py-28 lg:px-12"><div className="mx-auto flex max-w-7xl flex-col items-start justify-between gap-8 rounded-3xl bg-navy p-8 text-white sm:p-12 lg:flex-row lg:items-end"><div className="max-w-2xl"><div className="text-xs font-bold uppercase tracking-[0.18em] text-cyan-300">Built carefully, not loudly</div><h2 className="mt-5 text-3xl font-semibold tracking-[-0.04em] sm:text-5xl">Bring evidence and rules into the same review.</h2></div><Link className="marketing-primary shrink-0" href="/request-access">Request access <ArrowRight size={17} /></Link></div></section>
+        <section className="bg-warm px-5 py-20 text-ink sm:px-8 sm:py-28 lg:px-12"><div className="mx-auto flex max-w-7xl flex-col items-start justify-between gap-8 rounded-3xl bg-navy p-8 text-white sm:p-12 lg:flex-row lg:items-end"><div className="max-w-2xl"><div className="text-xs font-bold uppercase tracking-[0.18em] text-cyan-300">Built carefully, not loudly</div><h2 className="mt-5 text-3xl font-semibold tracking-[-0.04em] sm:text-5xl">Bring evidence and rules into the same review.</h2></div><Link className="marketing-primary shrink-0" href="/app">Open demo <ArrowRight size={17} /></Link></div></section>
       </main>
       <MarketingFooter />
     </div>
